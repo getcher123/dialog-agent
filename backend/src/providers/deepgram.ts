@@ -23,7 +23,10 @@ export function connectDeepgramStream(
     sample_rate: String(sampleRate),
     channels: "1",
     smart_format: "true",
-    interim_results: "true"
+    interim_results: "true",
+    endpointing: "300",
+    utterance_end_ms: "1000",
+    vad_events: "true"
   });
 
   const socket = new WebSocket(`wss://api.deepgram.com/v1/listen?${params.toString()}`, {
@@ -42,14 +45,21 @@ export function connectDeepgramStream(
     try {
       const event = JSON.parse(text);
 
+      if (event.type === "UtteranceEnd") {
+        callbacks.onFinalSegment("", true);
+        return;
+      }
+
       if (event.type !== "Results") {
         return;
       }
 
       const transcript = event.channel?.alternatives?.[0]?.transcript ?? "";
+      const isFinal = Boolean(event.is_final);
+      const speechFinal = Boolean(event.speech_final);
 
-      if (event.is_final) {
-        callbacks.onFinalSegment(transcript, Boolean(event.speech_final));
+      if (isFinal || speechFinal) {
+        callbacks.onFinalSegment(transcript, speechFinal);
         return;
       }
 
