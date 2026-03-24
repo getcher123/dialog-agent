@@ -34,6 +34,9 @@ type ServerEvent =
       traceId: string;
       totalMs: number;
       firstByteMs?: number;
+      sttFinalizeMs?: number;
+      voiceToAudioFirstByteMs?: number;
+      voiceToAudioDeliveredMs?: number;
       stages: Array<{
         name: string;
         durationMs: number;
@@ -354,12 +357,24 @@ function handleServerEvent(event: ServerEvent): void {
     case "pipeline.metrics":
       latencyStatus.textContent = `${event.totalMs} ms`;
       processingStatus.textContent = "done";
+      {
+        const extras = [
+          event.sttFinalizeMs !== undefined ? `sttFinalize=${event.sttFinalizeMs}ms` : null,
+          event.voiceToAudioFirstByteMs !== undefined
+            ? `voiceToAudioFirstByte=${event.voiceToAudioFirstByteMs}ms`
+            : null,
+          event.voiceToAudioDeliveredMs !== undefined
+            ? `voiceToAudioDelivered=${event.voiceToAudioDeliveredMs}ms`
+            : null
+        ].filter(Boolean);
+
       addEventRow(
         "Pipeline",
-        `${event.totalMs} ms total; ${event.stages
-          .map((stage) => `${stage.name}=${stage.durationMs}ms`)
-          .join(", ")}`
+          `${event.totalMs} ms total; ${event.stages
+            .map((stage) => `${stage.name}=${stage.durationMs}ms`)
+            .join(", ")}${extras.length ? `; ${extras.join(", ")}` : ""}`
       );
+      }
       return;
 
     case "server.warning":

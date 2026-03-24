@@ -25,15 +25,21 @@ export interface RuntimeSessionState {
   deepgram?: WebSocket;
   deepgramReady: boolean;
   pendingAudioChunks: Buffer[];
+  lastAudioChunkAt?: number;
 }
 
 type SendFn = (connection: WebSocket, event: ServerEvent) => void;
 const SHARED_KNOWLEDGE_SOURCE = "shared-ui-knowledge";
 
+export interface VoiceLatencyContext {
+  voiceInputEndedAt: number;
+  transcriptFinalizedAt: number;
+}
+
 export async function startSpeechRecognition(
   runtime: RuntimeSessionState,
   send: SendFn,
-  onFinalTranscript: (transcript: string) => void
+  onFinalTranscript: (transcript: string, latencyContext: VoiceLatencyContext) => void
 ): Promise<void> {
   runtime.deepgram?.close();
   runtime.deepgramReady = false;
@@ -79,6 +85,8 @@ export async function startSpeechRecognition(
       }
 
       const transcript = runtime.finalSegments.join(" ").replace(/\s+/g, " ").trim();
+      const transcriptFinalizedAt = Date.now();
+      const voiceInputEndedAt = runtime.lastAudioChunkAt ?? transcriptFinalizedAt;
       runtime.finalSegments = [];
 
       if (!transcript) {
@@ -99,7 +107,10 @@ export async function startSpeechRecognition(
         detail: "Utterance finalized. Running retrieval, generation and speech synthesis."
       });
 
-      onFinalTranscript(transcript);
+      onFinalTranscript(transcript, {
+        voiceInputEndedAt,
+        transcriptFinalizedAt
+      });
     },
     onError: (message) => {
       send(runtime.connection, {
@@ -147,7 +158,8 @@ export async function indexMarkdownKnowledge(runtime: RuntimeSessionState): Prom
 export function queueAssistantResponse(
   runtime: RuntimeSessionState,
   transcript: string,
-  send: SendFn
+  send: SendFn,
+  latencyContext?: VoiceLatencyContext
 ): void {
   runtime.processing = runtime.processing
     .then(async () => {
@@ -198,6 +210,7 @@ export function queueAssistantResponse(
           bytes: tts.audioBuffer.byteLength
         });
 
+        const audioDeliveredAt = Date.now();
         send(runtime.connection, {
           type: "audio.response",
           sessionId: runtime.sessionId,
@@ -206,17 +219,33 @@ export function queueAssistantResponse(
           bytes: tts.audioBuffer.byteLength
         });
 
+        const sttFinalizeMs = latencyContext
+          ? Math.max(0, latencyContext.transcriptFinalizedAt - latencyContext.voiceInputEndedAt)
+          : undefined;
+        const voiceToAudioFirstByteMs = latencyContext
+          ? Math.max(0, ttsStartedAt + tts.firstByteMs - latencyContext.voiceInputEndedAt)
+          : undefined;
+        const voiceToAudioDeliveredMs = latencyContext
+          ? Math.max(0, audioDeliveredAt - latencyContext.voiceInputEndedAt)
+          : undefined;
+
         send(runtime.connection, {
           type: "pipeline.metrics",
           sessionId: runtime.sessionId,
           traceId: trace.traceId,
           totalMs: Date.now() - trace.startedAt,
           firstByteMs: completion.firstByteMs,
+          sttFinalizeMs,
+          voiceToAudioFirstByteMs,
+          voiceToAudioDeliveredMs,
           stages: trace.getStageSummaries()
         });
 
         trace.flush({
-          status: "ok"
+          status: "ok",
+          sttFinalizeMs,
+          voiceToAudioFirstByteMs,
+          voiceToAudioDeliveredMs
         });
 
         send(runtime.connection, {

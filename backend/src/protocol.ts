@@ -78,6 +78,9 @@ export type ServerEvent =
       traceId: string;
       totalMs: number;
       firstByteMs?: number;
+      sttFinalizeMs?: number;
+      voiceToAudioFirstByteMs?: number;
+      voiceToAudioDeliveredMs?: number;
       stages: Array<{
         name: string;
         durationMs: number;
