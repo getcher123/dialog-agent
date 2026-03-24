@@ -8,6 +8,10 @@ export type ClientEvent =
       markdown: string;
     }
   | {
+      type: "text.turn";
+      text: string;
+    }
+  | {
       type: "client.ping";
       at: number;
     }
@@ -26,6 +30,13 @@ export type ServerEvent =
       sessionId: string;
     }
   | {
+      type: "knowledge.indexing";
+      sessionId: string;
+      status: "started" | "completed" | "failed";
+      scope: "shared";
+      message: string;
+    }
+  | {
       type: "knowledge.indexed";
       sessionId: string;
       characters: number;
@@ -35,7 +46,7 @@ export type ServerEvent =
   | {
       type: "server.status";
       sessionId: string;
-      phase: "idle" | "connected" | "knowledge_ready";
+      phase: string;
       detail: string;
     }
   | {

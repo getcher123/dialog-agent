@@ -4,6 +4,13 @@ type ServerEvent =
   | { type: "connection.ready"; sessionId: string }
   | { type: "session.started"; sessionId: string }
   | {
+      type: "knowledge.indexing";
+      sessionId: string;
+      status: "started" | "completed" | "failed";
+      scope: "shared";
+      message: string;
+    }
+  | {
       type: "knowledge.indexed";
       sessionId: string;
       characters: number;
@@ -38,14 +45,20 @@ type ServerEvent =
 const startButton = getRequiredElement<HTMLButtonElement>("#start-button");
 const stopButton = getRequiredElement<HTMLButtonElement>("#stop-button");
 const applyKnowledgeButton = getRequiredElement<HTMLButtonElement>("#apply-knowledge");
+const sendTextButton = getRequiredElement<HTMLButtonElement>("#send-text");
 const knowledgeInput = getRequiredElement<HTMLTextAreaElement>("#knowledge-input");
+const textMessageInput = getRequiredElement<HTMLTextAreaElement>("#text-message-input");
 const eventsLog = getRequiredElement<HTMLDivElement>("#events-log");
+const chatLog = getRequiredElement<HTMLDivElement>("#chat-log");
 const sessionIdLabel = getRequiredElement<HTMLSpanElement>("#session-id");
 const connectionPill = getRequiredElement<HTMLSpanElement>("#connection-pill");
 const micStatus = getRequiredElement<HTMLElement>("#mic-status");
 const wsStatus = getRequiredElement<HTMLElement>("#ws-status");
 const latencyStatus = getRequiredElement<HTMLElement>("#latency-status");
 const knowledgeStatus = getRequiredElement<HTMLElement>("#knowledge-status");
+const triggerStatus = getRequiredElement<HTMLElement>("#trigger-status");
+const processingStatus = getRequiredElement<HTMLElement>("#processing-status");
+const pipelineHint = getRequiredElement<HTMLElement>("#pipeline-hint");
 const waveform = getRequiredElement<HTMLCanvasElement>("#waveform");
 
 let socket: WebSocket | null = null;
@@ -59,7 +72,8 @@ let silentGain: GainNode | null = null;
 let waveformFrame = 0;
 let lastPingAt = 0;
 let activeAudio: HTMLAudioElement | null = null;
-let assistantPartial = "";
+let isIndexingKnowledge = false;
+let assistantPartialBubble: HTMLElement | null = null;
 
 startButton.addEventListener("click", () => {
   void startSession();
@@ -70,24 +84,18 @@ stopButton.addEventListener("click", () => {
 });
 
 applyKnowledgeButton.addEventListener("click", () => {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    addEventRow("Client", "Open session first to send markdown knowledge.");
-    return;
+  sendKnowledgeForIndexing();
+});
+
+sendTextButton.addEventListener("click", () => {
+  sendTextTurn();
+});
+
+textMessageInput.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    sendTextTurn();
   }
-
-  const markdown = knowledgeInput.value.trim();
-
-  if (!markdown) {
-    addEventRow("Client", "Knowledge textarea is empty.");
-    return;
-  }
-
-  socket.send(
-    JSON.stringify({
-      type: "knowledge.set",
-      markdown
-    })
-  );
 });
 
 async function startSession(): Promise<void> {
@@ -100,6 +108,9 @@ async function startSession(): Promise<void> {
       audio: true
     });
     micStatus.textContent = "live";
+    triggerStatus.textContent = "waiting for speech";
+    processingStatus.textContent = "idle";
+    pipelineHint.textContent = "Microphone open. Start speaking. Inference begins after a short pause in speech.";
     startButton.disabled = true;
     stopButton.disabled = false;
 
@@ -109,6 +120,8 @@ async function startSession(): Promise<void> {
     const message = error instanceof Error ? error.message : "Microphone permission failed";
     addEventRow("Client", `Microphone error: ${message}`);
     micStatus.textContent = "error";
+    triggerStatus.textContent = "blocked";
+    pipelineHint.textContent = "Microphone access is required for voice mode.";
     startButton.disabled = false;
     stopButton.disabled = true;
   }
@@ -142,17 +155,68 @@ function stopSession(): void {
   silentGain = null;
   cancelAnimationFrame(waveformFrame);
   drawIdleWaveform();
-  assistantPartial = "";
   sessionId = "n/a";
+  assistantPartialBubble = null;
   updateSessionId();
   setConnectionState("idle");
   micStatus.textContent = "off";
   wsStatus.textContent = "disconnected";
   latencyStatus.textContent = "pending";
-  knowledgeStatus.textContent = "empty";
+  triggerStatus.textContent = "not armed";
+  processingStatus.textContent = "idle";
+  pipelineHint.textContent = "Press Start. Trigger happens automatically after speech pause is detected.";
   startButton.disabled = false;
   stopButton.disabled = true;
-  applyKnowledgeButton.disabled = true;
+  sendTextButton.disabled = true;
+  updateKnowledgeUiState(false, knowledgeInput.value.trim() ? knowledgeStatus.textContent ?? "shared" : "empty");
+}
+
+function sendKnowledgeForIndexing(): void {
+  if (isIndexingKnowledge) {
+    return;
+  }
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    addEventRow("Client", "Open session first to index markdown knowledge.");
+    return;
+  }
+
+  const markdown = knowledgeInput.value.trim();
+
+  if (!markdown) {
+    addEventRow("Client", "Knowledge textarea is empty.");
+    return;
+  }
+
+  updateKnowledgeUiState(true, "indexing...");
+  addEventRow("Client", "Knowledge indexing requested.");
+  socket.send(
+    JSON.stringify({
+      type: "knowledge.set",
+      markdown
+    })
+  );
+}
+
+function sendTextTurn(): void {
+  const text = textMessageInput.value.trim();
+
+  if (!text) {
+    return;
+  }
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    addEventRow("Client", "Open session first to send text messages.");
+    return;
+  }
+
+  textMessageInput.value = "";
+  socket.send(
+    JSON.stringify({
+      type: "text.turn",
+      text
+    })
+  );
 }
 
 function connectWebSocket(): void {
@@ -169,11 +233,13 @@ function connectWebSocket(): void {
 
   socket = new WebSocket(url);
   wsStatus.textContent = "connecting";
+  triggerStatus.textContent = "arming";
   setConnectionState("connecting");
 
   socket.addEventListener("open", () => {
     wsStatus.textContent = "connected";
-    applyKnowledgeButton.disabled = false;
+    sendTextButton.disabled = false;
+    updateKnowledgeUiState(false, knowledgeInput.value.trim() ? "shared / stale" : "empty");
     addEventRow("Client", `WS connected: ${url}`);
 
     socket?.send(
@@ -203,6 +269,8 @@ function connectWebSocket(): void {
 
   socket.addEventListener("close", () => {
     wsStatus.textContent = "closed";
+    sendTextButton.disabled = true;
+    applyKnowledgeButton.disabled = true;
     setConnectionState("idle");
     addEventRow("Client", "WS connection closed.");
   });
@@ -220,18 +288,38 @@ function handleServerEvent(event: ServerEvent): void {
       sessionId = event.sessionId;
       updateSessionId();
       setConnectionState("live");
+      triggerStatus.textContent = "listening";
+      processingStatus.textContent = "ready";
+      pipelineHint.textContent = "Voice trigger is automatic: speak, pause briefly, then inference starts.";
       addEventRow("Server", `Session started: ${event.sessionId}`);
       return;
 
+    case "knowledge.indexing":
+      if (event.status === "started") {
+        updateKnowledgeUiState(true, "indexing...");
+      }
+
+      if (event.status === "completed") {
+        updateKnowledgeUiState(false, "shared / ready");
+      }
+
+      if (event.status === "failed") {
+        updateKnowledgeUiState(false, "index failed");
+      }
+
+      addEventRow("Knowledge", `${event.scope}: ${event.message}`);
+      return;
+
     case "knowledge.indexed":
-      knowledgeStatus.textContent = `${event.chunks} chunks`;
+      updateKnowledgeUiState(false, `shared / ${event.chunks} chunks`);
       addEventRow(
         "Server",
-        `Markdown indexed for session ${event.sessionId}. ${event.characters} chars, ${event.lines} lines, ${event.chunks} chunks.`
+        `Markdown indexed. ${event.characters} chars, ${event.lines} lines, ${event.chunks} chunks. Available to future sessions.`
       );
       return;
 
     case "server.status":
+      reflectPipelineStatus(event.phase, event.detail);
       addEventRow("Status", `${event.phase}: ${event.detail}`);
       return;
 
@@ -244,19 +332,18 @@ function handleServerEvent(event: ServerEvent): void {
 
     case "transcript.partial":
       if (event.role === "assistant") {
-        assistantPartial += event.text;
-        addEventRow("Assistant Δ", assistantPartial.slice(-180));
+        upsertAssistantPartialBubble(event.text);
       } else {
-        addEventRow("User Δ", event.text);
+        triggerStatus.textContent = "speech detected";
       }
       return;
 
     case "transcript.final":
       if (event.role === "assistant") {
-        assistantPartial = "";
-        addEventRow("Assistant", event.text);
+        finalizeAssistantBubble(event.text);
       } else {
-        addEventRow("User", event.text);
+        assistantPartialBubble = null;
+        appendChatBubble("user", event.text);
       }
       return;
 
@@ -267,6 +354,7 @@ function handleServerEvent(event: ServerEvent): void {
 
     case "pipeline.metrics":
       latencyStatus.textContent = `${event.totalMs} ms`;
+      processingStatus.textContent = "done";
       addEventRow(
         "Pipeline",
         `${event.totalMs} ms total; ${event.stages
@@ -280,8 +368,40 @@ function handleServerEvent(event: ServerEvent): void {
       return;
 
     case "server.error":
+      processingStatus.textContent = "error";
       addEventRow("Error", event.message);
       return;
+  }
+}
+
+function reflectPipelineStatus(phase: string, detail: string): void {
+  pipelineHint.textContent = detail;
+
+  if (phase === "idle") {
+    triggerStatus.textContent = "idle";
+    processingStatus.textContent = "idle";
+    return;
+  }
+
+  if (phase === "connected" || phase === "listening") {
+    triggerStatus.textContent = "listening";
+    processingStatus.textContent = "armed";
+    return;
+  }
+
+  if (phase === "processing") {
+    triggerStatus.textContent = "triggered";
+    processingStatus.textContent = "running";
+    return;
+  }
+
+  if (phase === "knowledge_ready") {
+    processingStatus.textContent = "knowledge ready";
+    return;
+  }
+
+  if (phase === "error") {
+    processingStatus.textContent = "error";
   }
 }
 
@@ -290,6 +410,51 @@ function addEventRow(title: string, body: string): void {
   row.className = "event-row";
   row.innerHTML = `<strong>${escapeHtml(title)}</strong><span>${escapeHtml(body)}</span>`;
   eventsLog.prepend(row);
+}
+
+function appendChatBubble(role: "user" | "assistant", text: string): HTMLElement {
+  const bubble = document.createElement("article");
+  bubble.className = `chat-bubble chat-bubble-${role}`;
+  bubble.innerHTML = `<strong>${role === "user" ? "You" : "Assistant"}</strong><p>${escapeHtml(text)}</p>`;
+  chatLog.appendChild(bubble);
+  chatLog.scrollTop = chatLog.scrollHeight;
+  return bubble;
+}
+
+function upsertAssistantPartialBubble(text: string): void {
+  if (!assistantPartialBubble) {
+    assistantPartialBubble = appendChatBubble("assistant", text);
+    assistantPartialBubble.classList.add("chat-bubble-partial");
+    return;
+  }
+
+  const paragraph = assistantPartialBubble.querySelector("p");
+  if (paragraph) {
+    paragraph.textContent = text;
+  }
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function finalizeAssistantBubble(text: string): void {
+  if (!assistantPartialBubble) {
+    appendChatBubble("assistant", text);
+    return;
+  }
+
+  assistantPartialBubble.classList.remove("chat-bubble-partial");
+  const paragraph = assistantPartialBubble.querySelector("p");
+  if (paragraph) {
+    paragraph.textContent = text;
+  }
+  assistantPartialBubble = null;
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function updateKnowledgeUiState(isIndexing: boolean, label: string): void {
+  isIndexingKnowledge = isIndexing;
+  knowledgeStatus.textContent = label;
+  applyKnowledgeButton.disabled = isIndexing || !socket || socket.readyState !== WebSocket.OPEN;
+  applyKnowledgeButton.textContent = isIndexing ? "Indexing..." : "Index Markdown";
 }
 
 async function playAudioResponse(base64: string, mimeType: string): Promise<void> {

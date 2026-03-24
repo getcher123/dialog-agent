@@ -26,6 +26,7 @@ export interface RuntimeSessionState {
 }
 
 type SendFn = (connection: WebSocket, event: ServerEvent) => void;
+const SHARED_KNOWLEDGE_SOURCE = "shared-ui-knowledge";
 
 export async function startSpeechRecognition(
   runtime: RuntimeSessionState,
@@ -43,6 +44,13 @@ export async function startSpeechRecognition(
       });
     },
     onPartial: (text) => {
+      send(runtime.connection, {
+        type: "server.status",
+        sessionId: runtime.sessionId,
+        phase: "listening",
+        detail: "Speech detected. Inference starts automatically after a short pause in speech."
+      });
+
       send(runtime.connection, {
         type: "transcript.partial",
         sessionId: runtime.sessionId,
@@ -73,6 +81,13 @@ export async function startSpeechRecognition(
         text: transcript
       });
 
+      send(runtime.connection, {
+        type: "server.status",
+        sessionId: runtime.sessionId,
+        phase: "processing",
+        detail: "Utterance finalized. Running retrieval, generation and speech synthesis."
+      });
+
       onFinalTranscript(transcript);
     },
     onError: (message) => {
@@ -89,9 +104,9 @@ export async function indexMarkdownKnowledge(runtime: RuntimeSessionState): Prom
   lines: number;
   chunks: number;
 }> {
-  const chunks = chunkMarkdown(runtime.knowledgeMarkdown, runtime.sessionId);
+  const chunks = chunkMarkdown(runtime.knowledgeMarkdown, SHARED_KNOWLEDGE_SOURCE);
   await ensureCollection();
-  await deleteKnowledgeBySource(runtime.sessionId);
+  await deleteKnowledgeBySource(SHARED_KNOWLEDGE_SOURCE);
 
   if (chunks.length === 0) {
     return {
@@ -104,7 +119,7 @@ export async function indexMarkdownKnowledge(runtime: RuntimeSessionState): Prom
   const embeddings = await embedTexts(chunks.map((chunk) => chunk.text));
 
   await upsertKnowledge(
-    runtime.sessionId,
+    SHARED_KNOWLEDGE_SOURCE,
     chunks.map((chunk, index) => ({
       ...chunk,
       embedding: embeddings[index] ?? embeddings[0]
@@ -135,9 +150,9 @@ export function queueAssistantResponse(
         });
 
         const retrievalStartedAt = Date.now();
-        const matches = (await searchKnowledge(queryEmbedding, 3)).filter(
-          (match) => match.source === runtime.sessionId
-        );
+        const matches = (await searchKnowledge(queryEmbedding, 3)).filter((match) => {
+          return match.source === SHARED_KNOWLEDGE_SOURCE;
+        });
         trace.completeStage("qdrant_query", retrievalStartedAt, Date.now(), {
           hits: matches.length
         });
@@ -194,6 +209,13 @@ export function queueAssistantResponse(
         trace.flush({
           status: "ok"
         });
+
+        send(runtime.connection, {
+          type: "server.status",
+          sessionId: runtime.sessionId,
+          phase: "listening",
+          detail: "Response delivered. Listening for the next utterance."
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown voice pipeline error";
         log("pipeline.trace.failed", {
@@ -206,6 +228,13 @@ export function queueAssistantResponse(
         send(runtime.connection, {
           type: "server.error",
           message
+        });
+
+        send(runtime.connection, {
+          type: "server.status",
+          sessionId: runtime.sessionId,
+          phase: "error",
+          detail: "Pipeline failed. Check the event log and try again."
         });
       }
     })

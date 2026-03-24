@@ -284,14 +284,30 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
       runtime.knowledgeMarkdown = event.markdown;
 
       send(connection, {
+        type: "knowledge.indexing",
+        sessionId: updated.id,
+        status: "started",
+        scope: "shared",
+        message: "Indexing started. Existing shared knowledge will be replaced after embeddings are generated."
+      });
+
+      send(connection, {
         type: "server.status",
         sessionId: updated.id,
         phase: updated.phase,
-        detail: "Markdown received. Creating embeddings and indexing into Qdrant local."
+        detail: "Markdown received. Creating embeddings and indexing into shared Qdrant knowledge."
       });
 
       void indexMarkdownKnowledge(runtime)
         .then((result) => {
+          send(connection, {
+            type: "knowledge.indexing",
+            sessionId: updated.id,
+            status: "completed",
+            scope: "shared",
+            message: `Shared knowledge updated. ${result.chunks} chunks are now available to all new sessions.`
+          });
+
           send(connection, {
             type: "knowledge.indexed",
             sessionId: updated.id,
@@ -304,15 +320,56 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
             type: "server.status",
             sessionId: updated.id,
             phase: updated.phase,
-            detail: `Knowledge indexed with ${result.chunks} chunks in Qdrant local.`
+            detail: `Shared knowledge indexed with ${result.chunks} chunks and will persist for future sessions.`
           });
         })
         .catch((error) => {
+          send(connection, {
+            type: "knowledge.indexing",
+            sessionId: updated.id,
+            status: "failed",
+            scope: "shared",
+            message:
+              error instanceof Error ? error.message : "Knowledge indexing failed unexpectedly"
+          });
+
           send(connection, {
             type: "server.error",
             message: error instanceof Error ? error.message : "Knowledge indexing failed"
           });
         });
+      return;
+    }
+
+    case "text.turn": {
+      const text = event.text.trim();
+
+      if (!text) {
+        send(connection, {
+          type: "server.warning",
+          sessionId: session.id,
+          message: "Text turn is empty."
+        });
+        return;
+      }
+
+      sessionManager.setLastUserTranscript(connection, text);
+
+      send(connection, {
+        type: "transcript.final",
+        sessionId: session.id,
+        role: "user",
+        text
+      });
+
+      send(connection, {
+        type: "server.status",
+        sessionId: session.id,
+        phase: "processing",
+        detail: "Text message received. Running retrieval, generation and speech synthesis."
+      });
+
+      queueAssistantResponse(runtime, text, send);
       return;
     }
 
