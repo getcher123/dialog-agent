@@ -9,6 +9,8 @@ type ServerEvent =
       status: "started" | "completed" | "failed";
       scope: "shared";
       message: string;
+      stage?: "queued" | "chunking" | "embedding" | "storing" | "completed" | "failed";
+      progressPercent?: number;
     }
   | {
       type: "knowledge.indexed";
@@ -80,6 +82,9 @@ const triggerStatus = getRequiredElement<HTMLElement>("#trigger-status");
 const processingStatus = getRequiredElement<HTMLElement>("#processing-status");
 const pipelineHint = getRequiredElement<HTMLElement>("#pipeline-hint");
 const waveform = getRequiredElement<HTMLCanvasElement>("#waveform");
+const knowledgeProgressLabel = getRequiredElement<HTMLElement>("#knowledge-progress-label");
+const knowledgeProgressValue = getRequiredElement<HTMLElement>("#knowledge-progress-value");
+const knowledgeProgressFill = getRequiredElement<HTMLElement>("#knowledge-progress-fill");
 
 interface AudioStreamPlayback {
   audio: HTMLAudioElement;
@@ -109,6 +114,7 @@ let activeAudioUrl: string | null = null;
 let activeAudioStream: AudioStreamPlayback | null = null;
 let isIndexingKnowledge = false;
 let assistantPartialBubble: HTMLElement | null = null;
+let socketConnectPromise: Promise<void> | null = null;
 
 startButton.addEventListener("click", () => {
   void startSession();
@@ -119,11 +125,15 @@ stopButton.addEventListener("click", () => {
 });
 
 applyKnowledgeButton.addEventListener("click", () => {
-  sendKnowledgeForIndexing();
+  void sendKnowledgeForIndexing();
 });
 
 sendTextButton.addEventListener("click", () => {
-  sendTextTurn();
+  void sendTextTurn();
+});
+
+knowledgeInput.addEventListener("input", () => {
+  updateKnowledgeUiState(isIndexingKnowledge, knowledgeStatus.textContent ?? "empty");
 });
 
 textMessageInput.addEventListener("keydown", (event) => {
@@ -134,9 +144,11 @@ textMessageInput.addEventListener("keydown", (event) => {
 });
 
 async function startSession(): Promise<void> {
-  if (socket?.readyState === WebSocket.OPEN) {
+  if (mediaStream) {
     return;
   }
+
+  const hadOpenSocket = socket?.readyState === WebSocket.OPEN;
 
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -150,7 +162,15 @@ async function startSession(): Promise<void> {
     stopButton.disabled = false;
 
     setupWaveform(mediaStream);
-    connectWebSocket();
+    await ensureSocketConnected();
+    if (hadOpenSocket) {
+      socket?.send(
+        JSON.stringify({
+          type: "session.start",
+          sampleRate: Math.round(audioContext?.sampleRate ?? 16000)
+        })
+      );
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Microphone permission failed";
     addEventRow("Client", `Microphone error: ${message}`);
@@ -200,17 +220,12 @@ function stopSession(): void {
   pipelineHint.textContent = "Press Start. Trigger happens automatically after speech pause is detected.";
   startButton.disabled = false;
   stopButton.disabled = true;
-  sendTextButton.disabled = true;
+  sendTextButton.disabled = false;
   updateKnowledgeUiState(false, knowledgeInput.value.trim() ? knowledgeStatus.textContent ?? "shared" : "empty");
 }
 
-function sendKnowledgeForIndexing(): void {
+async function sendKnowledgeForIndexing(): Promise<void> {
   if (isIndexingKnowledge) {
-    return;
-  }
-
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    addEventRow("Client", "Open session first to index markdown knowledge.");
     return;
   }
 
@@ -221,9 +236,11 @@ function sendKnowledgeForIndexing(): void {
     return;
   }
 
+  await ensureSocketConnected();
   updateKnowledgeUiState(true, "indexing...");
+  updateKnowledgeProgress(4, "Preparing shared indexing session.");
   addEventRow("Client", "Knowledge indexing requested.");
-  socket.send(
+  socket?.send(
     JSON.stringify({
       type: "knowledge.set",
       markdown
@@ -231,20 +248,16 @@ function sendKnowledgeForIndexing(): void {
   );
 }
 
-function sendTextTurn(): void {
+async function sendTextTurn(): Promise<void> {
   const text = textMessageInput.value.trim();
 
   if (!text) {
     return;
   }
 
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    addEventRow("Client", "Open session first to send text messages.");
-    return;
-  }
-
+  await ensureSocketConnected();
   textMessageInput.value = "";
-  socket.send(
+  socket?.send(
     JSON.stringify({
       type: "text.turn",
       text
@@ -252,7 +265,7 @@ function sendTextTurn(): void {
   );
 }
 
-function connectWebSocket(): void {
+function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => void): void {
   const configuredOrigin = import.meta.env.VITE_BACKEND_ORIGIN?.trim();
   const backendPort = import.meta.env.VITE_BACKEND_PORT ?? "3300";
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
@@ -282,6 +295,8 @@ function connectWebSocket(): void {
       })
     );
 
+    resolve?.();
+
     window.setTimeout(() => {
       if (socket?.readyState === WebSocket.OPEN) {
         lastPingAt = Date.now();
@@ -301,12 +316,40 @@ function connectWebSocket(): void {
   });
 
   socket.addEventListener("close", () => {
+    socketConnectPromise = null;
     wsStatus.textContent = "closed";
-    sendTextButton.disabled = true;
-    applyKnowledgeButton.disabled = true;
+    sendTextButton.disabled = false;
+    applyKnowledgeButton.disabled = isIndexingKnowledge || !knowledgeInput.value.trim();
     setConnectionState("idle");
     addEventRow("Client", "WS connection closed.");
   });
+
+  socket.addEventListener("error", (event) => {
+    socketConnectPromise = null;
+    reject?.(event);
+  });
+}
+
+async function ensureSocketConnected(): Promise<void> {
+  if (socket?.readyState === WebSocket.OPEN) {
+    return;
+  }
+
+  if (socketConnectPromise) {
+    return socketConnectPromise;
+  }
+
+  socketConnectPromise = new Promise<void>((resolve, reject) => {
+    connectWebSocket(resolve, reject);
+  });
+
+  try {
+    await socketConnectPromise;
+  } finally {
+    if (socket?.readyState !== WebSocket.CONNECTING) {
+      socketConnectPromise = null;
+    }
+  }
 }
 
 function handleServerEvent(event: ServerEvent): void {
@@ -321,23 +364,32 @@ function handleServerEvent(event: ServerEvent): void {
       sessionId = event.sessionId;
       updateSessionId();
       setConnectionState("live");
-      triggerStatus.textContent = "listening";
+      triggerStatus.textContent = mediaStream ? "listening" : "text ready";
       processingStatus.textContent = "ready";
-      pipelineHint.textContent = "Voice trigger is automatic: speak, pause briefly, then inference starts.";
+      pipelineHint.textContent = mediaStream
+        ? "Voice trigger is automatic: speak, pause briefly, then inference starts."
+        : "Connection is ready for text dialogue and knowledge indexing. Press Start only when you want live microphone mode.";
       addEventRow("Server", `Session started: ${event.sessionId}`);
       return;
 
     case "knowledge.indexing":
       if (event.status === "started") {
         updateKnowledgeUiState(true, "indexing...");
+        updateKnowledgeProgress(
+          event.progressPercent ?? 8,
+          event.message,
+          event.stage ? `Stage: ${event.stage}` : "Indexing"
+        );
       }
 
       if (event.status === "completed") {
         updateKnowledgeUiState(false, "shared / ready");
+        updateKnowledgeProgress(100, event.message, "Completed");
       }
 
       if (event.status === "failed") {
         updateKnowledgeUiState(false, "index failed");
+        updateKnowledgeProgress(100, event.message, "Failed");
       }
 
       addEventRow("Knowledge", `${event.scope}: ${event.message}`);
@@ -345,6 +397,7 @@ function handleServerEvent(event: ServerEvent): void {
 
     case "knowledge.indexed":
       updateKnowledgeUiState(false, `shared / ${event.chunks} chunks`);
+      updateKnowledgeProgress(100, `Indexed ${event.chunks} chunks for shared retrieval.`, "Completed");
       addEventRow(
         "Server",
         `Markdown indexed. ${event.characters} chars, ${event.lines} lines, ${event.chunks} chunks. Available to future sessions.`
@@ -512,8 +565,19 @@ function finalizeAssistantBubble(text: string): void {
 function updateKnowledgeUiState(isIndexing: boolean, label: string): void {
   isIndexingKnowledge = isIndexing;
   knowledgeStatus.textContent = label;
-  applyKnowledgeButton.disabled = isIndexing || !socket || socket.readyState !== WebSocket.OPEN;
+  applyKnowledgeButton.disabled = isIndexing || !knowledgeInput.value.trim();
   applyKnowledgeButton.textContent = isIndexing ? "Indexing..." : "Index Markdown";
+}
+
+function updateKnowledgeProgress(percent: number, detail: string, label?: string): void {
+  const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+  knowledgeProgressFill.style.width = `${clamped}%`;
+  knowledgeProgressValue.textContent = `${clamped}%`;
+  knowledgeProgressLabel.textContent = label ?? detail;
+  if (detail) {
+    knowledgeProgressFill.title = detail;
+    knowledgeProgressLabel.setAttribute("title", detail);
+  }
 }
 
 async function playAudioResponse(base64: string, mimeType: string): Promise<void> {
@@ -870,3 +934,5 @@ function escapeHtml(value: string): string {
 }
 
 drawIdleWaveform();
+sendTextButton.disabled = false;
+updateKnowledgeUiState(false, knowledgeInput.value.trim() ? "shared / stale" : "empty");

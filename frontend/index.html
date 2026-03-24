@@ -84,6 +84,15 @@
             class="knowledge-input"
             placeholder="# Product FAQ&#10;&#10;Вставь сюда markdown-контекст для будущего RAG пайплайна."
           ></textarea>
+          <div class="knowledge-progress-shell" aria-live="polite">
+            <div class="knowledge-progress-meta">
+              <strong id="knowledge-progress-label">Idle</strong>
+              <span id="knowledge-progress-value" class="mono">0%</span>
+            </div>
+            <div class="knowledge-progress-track">
+              <div id="knowledge-progress-fill" class="knowledge-progress-fill"></div>
+            </div>
+          </div>
           <p class="hint">
             Индекс общий: после успешной индексации этот knowledge доступен следующим
             сессиям, пока вы не замените его новым markdown.

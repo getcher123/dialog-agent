@@ -35,6 +35,8 @@ export type ServerEvent =
       status: "started" | "completed" | "failed";
       scope: "shared";
       message: string;
+      stage?: "queued" | "chunking" | "embedding" | "storing" | "completed" | "failed";
+      progressPercent?: number;
     }
   | {
       type: "knowledge.indexed";

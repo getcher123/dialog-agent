@@ -298,6 +298,8 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
         sessionId: updated.id,
         status: "started",
         scope: "shared",
+        stage: "queued",
+        progressPercent: 4,
         message: "Indexing started. Existing shared knowledge will be replaced after embeddings are generated."
       });
 
@@ -308,13 +310,25 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
         detail: "Markdown received. Creating embeddings and indexing into shared Qdrant knowledge."
       });
 
-      void indexMarkdownKnowledge(runtime)
+      void indexMarkdownKnowledge(runtime, (progress) => {
+        send(connection, {
+          type: "knowledge.indexing",
+          sessionId: updated.id,
+          status: "started",
+          scope: "shared",
+          stage: progress.stage,
+          progressPercent: progress.progressPercent,
+          message: progress.message
+        });
+      })
         .then((result) => {
           send(connection, {
             type: "knowledge.indexing",
             sessionId: updated.id,
             status: "completed",
             scope: "shared",
+            stage: "completed",
+            progressPercent: 100,
             message: `Shared knowledge updated. ${result.chunks} chunks are now available to all new sessions.`
           });
 
@@ -339,6 +353,8 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
             sessionId: updated.id,
             status: "failed",
             scope: "shared",
+            stage: "failed",
+            progressPercent: 100,
             message:
               error instanceof Error ? error.message : "Knowledge indexing failed unexpectedly"
           });

@@ -36,6 +36,12 @@ export interface VoiceLatencyContext {
   transcriptFinalizedAt: number;
 }
 
+interface KnowledgeIndexingProgress {
+  stage: "chunking" | "embedding" | "storing";
+  progressPercent: number;
+  message: string;
+}
+
 export async function startSpeechRecognition(
   runtime: RuntimeSessionState,
   send: SendFn,
@@ -121,11 +127,19 @@ export async function startSpeechRecognition(
   });
 }
 
-export async function indexMarkdownKnowledge(runtime: RuntimeSessionState): Promise<{
+export async function indexMarkdownKnowledge(
+  runtime: RuntimeSessionState,
+  onProgress?: (progress: KnowledgeIndexingProgress) => void
+): Promise<{
   characters: number;
   lines: number;
   chunks: number;
 }> {
+  onProgress?.({
+    stage: "chunking",
+    progressPercent: 14,
+    message: "Markdown normalized and split into retrieval chunks."
+  });
   const chunks = chunkMarkdown(runtime.knowledgeMarkdown, SHARED_KNOWLEDGE_SOURCE);
   await ensureCollection();
   await deleteKnowledgeBySource(SHARED_KNOWLEDGE_SOURCE);
@@ -138,8 +152,18 @@ export async function indexMarkdownKnowledge(runtime: RuntimeSessionState): Prom
     };
   }
 
+  onProgress?.({
+    stage: "embedding",
+    progressPercent: 52,
+    message: `Generating embeddings for ${chunks.length} chunks.`
+  });
   const embeddings = await embedTexts(chunks.map((chunk) => chunk.text));
 
+  onProgress?.({
+    stage: "storing",
+    progressPercent: 82,
+    message: `Writing ${chunks.length} chunks into the shared Qdrant collection.`
+  });
   await upsertKnowledge(
     SHARED_KNOWLEDGE_SOURCE,
     chunks.map((chunk, index) => ({
