@@ -23,6 +23,8 @@ export interface RuntimeSessionState {
   finalSegments: string[];
   processing: Promise<void>;
   deepgram?: WebSocket;
+  deepgramReady: boolean;
+  pendingAudioChunks: Buffer[];
 }
 
 type SendFn = (connection: WebSocket, event: ServerEvent) => void;
@@ -34,8 +36,17 @@ export async function startSpeechRecognition(
   onFinalTranscript: (transcript: string) => void
 ): Promise<void> {
   runtime.deepgram?.close();
+  runtime.deepgramReady = false;
+  runtime.pendingAudioChunks = [];
   runtime.deepgram = connectDeepgramStream(runtime.sampleRate, {
     onOpen: () => {
+      runtime.deepgramReady = true;
+
+      for (const chunk of runtime.pendingAudioChunks) {
+        runtime.deepgram?.send(chunk);
+      }
+      runtime.pendingAudioChunks = [];
+
       send(runtime.connection, {
         type: "server.status",
         sessionId: runtime.sessionId,

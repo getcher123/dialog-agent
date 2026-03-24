@@ -168,7 +168,9 @@ wsServer.on("connection", (connection) => {
     sampleRate: 16000,
     knowledgeMarkdown: "",
     finalSegments: [],
-    processing: Promise.resolve()
+    processing: Promise.resolve(),
+    deepgramReady: false,
+    pendingAudioChunks: []
   });
 
   log("ws.connection.opened", { sessionId: session.id });
@@ -228,7 +230,12 @@ function handleAudioChunk(connection: WebSocket, payload: RawData): void {
 
   const session = sessionManager.appendAudio(connection, bytes);
   const buffer = toBuffer(payload);
-  runtime.deepgram?.send(buffer);
+
+  if (runtime.deepgramReady && runtime.deepgram?.readyState === 1) {
+    runtime.deepgram.send(buffer);
+  } else if (runtime.deepgram && runtime.deepgram.readyState === 0) {
+    runtime.pendingAudioChunks.push(buffer);
+  }
 
   if (session.audioBytes === bytes || session.audioBytes % 32000 < bytes) {
     log("audio.append", {

@@ -22,6 +22,7 @@ export function connectDeepgramStream(
     encoding: "linear16",
     sample_rate: String(sampleRate),
     channels: "1",
+    language: "ru",
     smart_format: "true",
     interim_results: "true",
     endpointing: "300",
