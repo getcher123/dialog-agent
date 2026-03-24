@@ -72,6 +72,7 @@ let silentGain: GainNode | null = null;
 let waveformFrame = 0;
 let lastPingAt = 0;
 let activeAudio: HTMLAudioElement | null = null;
+let activeAudioUrl: string | null = null;
 let isIndexingKnowledge = false;
 let assistantPartialBubble: HTMLElement | null = null;
 
@@ -144,9 +145,7 @@ function stopSession(): void {
   }
 
   if (activeAudio) {
-    activeAudio.pause();
-    URL.revokeObjectURL(activeAudio.src);
-    activeAudio = null;
+    disposeActiveAudio();
   }
 
   analyser = null;
@@ -468,21 +467,56 @@ async function playAudioResponse(base64: string, mimeType: string): Promise<void
   const blob = new Blob([bytes], { type: mimeType });
   const url = URL.createObjectURL(blob);
 
-  if (activeAudio) {
-    activeAudio.pause();
-    URL.revokeObjectURL(activeAudio.src);
-  }
+  disposeActiveAudio();
 
-  activeAudio = new Audio(url);
-  activeAudio.addEventListener(
+  const audio = new Audio(url);
+  audio.preload = "auto";
+  audio.setAttribute("playsinline", "true");
+  activeAudio = audio;
+  activeAudioUrl = url;
+
+  audio.addEventListener(
     "ended",
     () => {
-      URL.revokeObjectURL(url);
+      disposeActiveAudio();
     },
     { once: true }
   );
 
-  await activeAudio.play();
+  audio.addEventListener(
+    "error",
+    () => {
+      addEventRow("Audio", "Playback failed: browser could not decode or start the audio stream.");
+    },
+    { once: true }
+  );
+
+  try {
+    if (audioContext?.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    await audio.play();
+    addEventRow("Audio", "Playback started.");
+  } catch (error) {
+    disposeActiveAudio();
+    const message = error instanceof Error ? error.message : "Unknown audio playback error";
+    addEventRow("Audio", `Playback failed: ${message}`);
+  }
+}
+
+function disposeActiveAudio(): void {
+  if (activeAudio) {
+    activeAudio.pause();
+    activeAudio.src = "";
+    activeAudio.load();
+    activeAudio = null;
+  }
+
+  if (activeAudioUrl) {
+    URL.revokeObjectURL(activeAudioUrl);
+    activeAudioUrl = null;
+  }
 }
 
 function updateSessionId(): void {
