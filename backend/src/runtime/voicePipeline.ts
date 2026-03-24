@@ -161,9 +161,7 @@ export function queueAssistantResponse(
         });
 
         const retrievalStartedAt = Date.now();
-        const matches = (await searchKnowledge(queryEmbedding, 3)).filter((match) => {
-          return match.source === SHARED_KNOWLEDGE_SOURCE;
-        });
+        const matches = await searchKnowledge(queryEmbedding, 3, SHARED_KNOWLEDGE_SOURCE);
         trace.completeStage("qdrant_query", retrievalStartedAt, Date.now(), {
           hits: matches.length
         });

@@ -88,9 +88,11 @@ export async function upsertKnowledge(
   }
 }
 
-export async function searchKnowledge(vector: number[], limit = 3): Promise<SearchMatch[]> {
-  await ensureCollection();
-
+export async function searchKnowledge(
+  vector: number[],
+  limit = 3,
+  source?: string
+): Promise<SearchMatch[]> {
   const response = await fetch(`${collectionUrl()}/points/query`, {
     method: "POST",
     headers: {
@@ -99,10 +101,28 @@ export async function searchKnowledge(vector: number[], limit = 3): Promise<Sear
     body: JSON.stringify({
       query: vector,
       limit,
-      with_payload: true
+      with_payload: true,
+      ...(source
+        ? {
+            filter: {
+              must: [
+                {
+                  key: "source",
+                  match: {
+                    value: source
+                  }
+                }
+              ]
+            }
+          }
+        : {})
     }),
     signal: AbortSignal.timeout(15000)
   });
+
+  if (response.status === 404) {
+    return [];
+  }
 
   const body = await response.json();
 
