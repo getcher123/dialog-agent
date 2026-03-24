@@ -204,29 +204,61 @@ export function queueAssistantResponse(
         });
 
         const ttsStartedAt = Date.now();
-        const tts = await streamElevenLabsTts(completion.text);
-        trace.completeStage("elevenlabs_tts", ttsStartedAt, Date.now(), {
-          firstByteMs: tts.firstByteMs,
-          bytes: tts.audioBuffer.byteLength
+        let audioFirstChunkSentAt: number | undefined;
+        let audioStreamCompletedAt: number | undefined;
+
+        send(runtime.connection, {
+          type: "audio.response.start",
+          sessionId: runtime.sessionId,
+          mimeType: "audio/mpeg"
         });
 
-        const audioDeliveredAt = Date.now();
+        const streamedTts = await streamElevenLabsTts({
+          text: completion.text,
+          onChunk: (chunk, info) => {
+            const chunkSentAt = Date.now();
+
+            if (audioFirstChunkSentAt === undefined) {
+              audioFirstChunkSentAt = chunkSentAt;
+            }
+
+            send(runtime.connection, {
+              type: "audio.response.chunk",
+              sessionId: runtime.sessionId,
+              base64: chunk.toString("base64"),
+              bytes: chunk.byteLength,
+              sequence: info.sequence
+            });
+          }
+        });
+        trace.completeStage("elevenlabs_tts", ttsStartedAt, Date.now(), {
+          firstByteMs: streamedTts.firstByteMs,
+          bytes: streamedTts.totalBytes
+        });
+
+        audioStreamCompletedAt = Date.now();
         send(runtime.connection, {
-          type: "audio.response",
+          type: "audio.response.end",
           sessionId: runtime.sessionId,
-          mimeType: tts.mimeType,
-          base64: tts.audioBuffer.toString("base64"),
-          bytes: tts.audioBuffer.byteLength
+          totalBytes: streamedTts.totalBytes
         });
 
         const sttFinalizeMs = latencyContext
           ? Math.max(0, latencyContext.transcriptFinalizedAt - latencyContext.voiceInputEndedAt)
           : undefined;
         const voiceToAudioFirstByteMs = latencyContext
-          ? Math.max(0, ttsStartedAt + tts.firstByteMs - latencyContext.voiceInputEndedAt)
+          ? Math.max(
+              0,
+              (audioFirstChunkSentAt ?? audioStreamCompletedAt ?? Date.now()) -
+                latencyContext.voiceInputEndedAt
+            )
           : undefined;
         const voiceToAudioDeliveredMs = latencyContext
-          ? Math.max(0, audioDeliveredAt - latencyContext.voiceInputEndedAt)
+          ? Math.max(
+              0,
+              (audioStreamCompletedAt ?? audioFirstChunkSentAt ?? Date.now()) -
+                latencyContext.voiceInputEndedAt
+            )
           : undefined;
 
         send(runtime.connection, {

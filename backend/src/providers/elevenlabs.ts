@@ -1,13 +1,25 @@
 import { env } from "../config/env.js";
 
-export interface TtsResult {
-  audioBuffer: Buffer;
+export interface TtsChunkInfo {
+  sequence: number;
+  totalBytes: number;
+}
+
+export interface TtsStreamResult {
   mimeType: string;
   firstByteMs: number;
   totalMs: number;
+  totalBytes: number;
 }
 
-export async function streamElevenLabsTts(text: string): Promise<TtsResult> {
+interface StreamElevenLabsTtsOptions {
+  text: string;
+  onChunk?: (chunk: Buffer, info: TtsChunkInfo) => void;
+}
+
+export async function streamElevenLabsTts(
+  options: StreamElevenLabsTtsOptions
+): Promise<TtsStreamResult> {
   if (!env.ELEVENLABS_API) {
     throw new Error("ELEVENLABS_API is not configured");
   }
@@ -27,7 +39,7 @@ export async function streamElevenLabsTts(text: string): Promise<TtsResult> {
         Accept: "audio/mpeg"
       },
       body: JSON.stringify({
-        text,
+        text: options.text,
         model_id: env.ELEVENLABS_MODEL_ID,
         output_format: "mp3_44100_128"
       }),
@@ -41,9 +53,9 @@ export async function streamElevenLabsTts(text: string): Promise<TtsResult> {
   }
 
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
   let firstByteMs = 0;
-  let totalLength = 0;
+  let totalBytes = 0;
+  let sequence = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -55,23 +67,20 @@ export async function streamElevenLabsTts(text: string): Promise<TtsResult> {
       firstByteMs = Date.now() - startedAt;
     }
 
-    chunks.push(value);
-    totalLength += value.byteLength;
-  }
+    const chunk = Buffer.from(value);
+    totalBytes += chunk.byteLength;
+    sequence += 1;
 
-  const audioBuffer = Buffer.allocUnsafe(totalLength);
-  let offset = 0;
-
-  for (const chunk of chunks) {
-    audioBuffer.set(chunk, offset);
-    offset += chunk.byteLength;
+    options.onChunk?.(chunk, {
+      sequence,
+      totalBytes
+    });
   }
 
   return {
-    audioBuffer,
     mimeType: "audio/mpeg",
     firstByteMs,
-    totalMs: Date.now() - startedAt
+    totalMs: Date.now() - startedAt,
+    totalBytes
   };
 }
-

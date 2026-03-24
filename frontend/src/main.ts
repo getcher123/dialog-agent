@@ -29,6 +29,23 @@ type ServerEvent =
       bytes: number;
     }
   | {
+      type: "audio.response.start";
+      sessionId: string;
+      mimeType: string;
+    }
+  | {
+      type: "audio.response.chunk";
+      sessionId: string;
+      base64: string;
+      bytes: number;
+      sequence: number;
+    }
+  | {
+      type: "audio.response.end";
+      sessionId: string;
+      totalBytes: number;
+    }
+  | {
       type: "pipeline.metrics";
       sessionId: string;
       traceId: string;
@@ -64,6 +81,19 @@ const processingStatus = getRequiredElement<HTMLElement>("#processing-status");
 const pipelineHint = getRequiredElement<HTMLElement>("#pipeline-hint");
 const waveform = getRequiredElement<HTMLCanvasElement>("#waveform");
 
+interface AudioStreamPlayback {
+  audio: HTMLAudioElement;
+  mimeType: string;
+  url: string | null;
+  mediaSource: MediaSource | null;
+  sourceBuffer: SourceBuffer | null;
+  chunkQueue: ArrayBuffer[];
+  fallbackChunks: ArrayBuffer[];
+  streamEnded: boolean;
+  playbackStarted: boolean;
+  totalBytes: number;
+}
+
 let socket: WebSocket | null = null;
 let sessionId = "n/a";
 let mediaStream: MediaStream | null = null;
@@ -76,6 +106,7 @@ let waveformFrame = 0;
 let lastPingAt = 0;
 let activeAudio: HTMLAudioElement | null = null;
 let activeAudioUrl: string | null = null;
+let activeAudioStream: AudioStreamPlayback | null = null;
 let isIndexingKnowledge = false;
 let assistantPartialBubble: HTMLElement | null = null;
 
@@ -349,6 +380,20 @@ function handleServerEvent(event: ServerEvent): void {
       }
       return;
 
+    case "audio.response.start":
+      addEventRow("Audio", "Streaming audio response started.");
+      startStreamingAudioResponse(event.mimeType);
+      return;
+
+    case "audio.response.chunk":
+      appendStreamingAudioChunk(event.base64, event.bytes);
+      return;
+
+    case "audio.response.end":
+      addEventRow("Audio", `${event.totalBytes} bytes streamed for playback.`);
+      finishStreamingAudioResponse();
+      return;
+
     case "audio.response":
       addEventRow("Audio", `${event.bytes} bytes ready for playback.`);
       void playAudioResponse(event.base64, event.mimeType);
@@ -472,23 +517,177 @@ function updateKnowledgeUiState(isIndexing: boolean, label: string): void {
 }
 
 async function playAudioResponse(base64: string, mimeType: string): Promise<void> {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
+  disposeActiveAudio();
+  const bytes = decodeBase64(base64);
+  await playAudioBlob(new Blob([bytes], { type: mimeType }));
+}
 
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
+function disposeActiveAudio(): void {
+  activeAudioStream = null;
+
+  if (activeAudio) {
+    activeAudio.pause();
+    activeAudio.src = "";
+    activeAudio.load();
+    activeAudio = null;
   }
 
-  const blob = new Blob([bytes], { type: mimeType });
-  const url = URL.createObjectURL(blob);
+  if (activeAudioUrl) {
+    URL.revokeObjectURL(activeAudioUrl);
+    activeAudioUrl = null;
+  }
+}
 
+function startStreamingAudioResponse(mimeType: string): void {
   disposeActiveAudio();
 
-  const audio = new Audio(url);
+  const audio = createPlaybackElement();
+  const stream: AudioStreamPlayback = {
+    audio,
+    mimeType,
+    url: null,
+    mediaSource: null,
+    sourceBuffer: null,
+    chunkQueue: [],
+    fallbackChunks: [],
+    streamEnded: false,
+    playbackStarted: false,
+    totalBytes: 0
+  };
+
+  activeAudioStream = stream;
+  activeAudio = audio;
+
+  if (typeof MediaSource !== "undefined" && MediaSource.isTypeSupported(mimeType)) {
+    const mediaSource = new MediaSource();
+    const url = URL.createObjectURL(mediaSource);
+    stream.mediaSource = mediaSource;
+    stream.url = url;
+    activeAudioUrl = url;
+    audio.src = url;
+
+    mediaSource.addEventListener(
+      "sourceopen",
+      () => {
+        if (activeAudioStream !== stream || !stream.mediaSource) {
+          return;
+        }
+
+        stream.sourceBuffer = stream.mediaSource.addSourceBuffer(mimeType);
+        stream.sourceBuffer.mode = "sequence";
+        stream.sourceBuffer.addEventListener("updateend", () => {
+          flushStreamingAudioQueue(stream);
+        });
+        flushStreamingAudioQueue(stream);
+      },
+      { once: true }
+    );
+    return;
+  }
+
+  addEventRow("Audio", `Streaming fallback enabled. Browser does not support ${mimeType} via MediaSource.`);
+}
+
+function appendStreamingAudioChunk(base64: string, bytes: number): void {
+  if (!activeAudioStream) {
+    return;
+  }
+
+  const chunk = decodeBase64(base64);
+  activeAudioStream.totalBytes += bytes;
+
+  if (activeAudioStream.mediaSource) {
+    activeAudioStream.chunkQueue.push(chunk);
+    flushStreamingAudioQueue(activeAudioStream);
+    return;
+  }
+
+  activeAudioStream.fallbackChunks.push(chunk);
+}
+
+function finishStreamingAudioResponse(): void {
+  if (!activeAudioStream) {
+    return;
+  }
+
+  activeAudioStream.streamEnded = true;
+
+  if (activeAudioStream.mediaSource) {
+    flushStreamingAudioQueue(activeAudioStream);
+    return;
+  }
+
+  void finalizeBufferedStreamingAudio(activeAudioStream);
+}
+
+function flushStreamingAudioQueue(stream: AudioStreamPlayback): void {
+  if (activeAudioStream !== stream || !stream.sourceBuffer || !stream.mediaSource) {
+    return;
+  }
+
+  if (stream.sourceBuffer.updating) {
+    return;
+  }
+
+  const nextChunk = stream.chunkQueue.shift();
+  if (nextChunk) {
+    stream.sourceBuffer.appendBuffer(nextChunk);
+    void ensureStreamingPlaybackStarted(stream);
+    return;
+  }
+
+  if (stream.streamEnded && stream.mediaSource.readyState === "open") {
+    stream.mediaSource.endOfStream();
+  }
+}
+
+async function finalizeBufferedStreamingAudio(stream: AudioStreamPlayback): Promise<void> {
+  if (activeAudioStream !== stream) {
+    return;
+  }
+
+  const blob = new Blob(stream.fallbackChunks, { type: stream.mimeType });
+  stream.fallbackChunks = [];
+
+  if (stream.url) {
+    URL.revokeObjectURL(stream.url);
+  }
+
+  const url = URL.createObjectURL(blob);
+  stream.url = url;
+  activeAudioUrl = url;
+  stream.audio.src = url;
+  await ensureStreamingPlaybackStarted(stream);
+}
+
+async function ensureStreamingPlaybackStarted(stream: AudioStreamPlayback): Promise<void> {
+  if (activeAudioStream !== stream || stream.playbackStarted) {
+    return;
+  }
+
+  try {
+    if (audioContext?.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    await stream.audio.play();
+    stream.playbackStarted = true;
+    addEventRow("Audio", "Playback started.");
+  } catch (error) {
+    if (activeAudioStream !== stream) {
+      return;
+    }
+
+    disposeActiveAudio();
+    const message = error instanceof Error ? error.message : "Unknown audio playback error";
+    addEventRow("Audio", `Playback failed: ${message}`);
+  }
+}
+
+function createPlaybackElement(): HTMLAudioElement {
+  const audio = new Audio();
   audio.preload = "auto";
   audio.setAttribute("playsinline", "true");
-  activeAudio = audio;
-  activeAudioUrl = url;
 
   audio.addEventListener(
     "ended",
@@ -506,6 +705,16 @@ async function playAudioResponse(base64: string, mimeType: string): Promise<void
     { once: true }
   );
 
+  return audio;
+}
+
+async function playAudioBlob(blob: Blob): Promise<void> {
+  const url = URL.createObjectURL(blob);
+  const audio = createPlaybackElement();
+  audio.src = url;
+  activeAudio = audio;
+  activeAudioUrl = url;
+
   try {
     if (audioContext?.state === "suspended") {
       await audioContext.resume();
@@ -520,18 +729,15 @@ async function playAudioResponse(base64: string, mimeType: string): Promise<void
   }
 }
 
-function disposeActiveAudio(): void {
-  if (activeAudio) {
-    activeAudio.pause();
-    activeAudio.src = "";
-    activeAudio.load();
-    activeAudio = null;
+function decodeBase64(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
   }
 
-  if (activeAudioUrl) {
-    URL.revokeObjectURL(activeAudioUrl);
-    activeAudioUrl = null;
-  }
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
 function updateSessionId(): void {

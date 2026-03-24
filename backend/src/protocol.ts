@@ -66,11 +66,21 @@ export type ServerEvent =
       text: string;
     }
   | {
-      type: "audio.response";
+      type: "audio.response.start";
       sessionId: string;
       mimeType: string;
+    }
+  | {
+      type: "audio.response.chunk";
+      sessionId: string;
       base64: string;
       bytes: number;
+      sequence: number;
+    }
+  | {
+      type: "audio.response.end";
+      sessionId: string;
+      totalBytes: number;
     }
   | {
       type: "pipeline.metrics";
