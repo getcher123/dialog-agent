@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0"
+    />
+    <title>Voice Agent RAG</title>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Voice Agent RAG MVP</p>
+          <h1>Realtime voice scaffold with markdown knowledge input</h1>
+          <p class="hero-copy">
+            Текущий срез проекта: подключение микрофона, waveform, WebSocket-session,
+            structured status events и markdown-контекст, вставляемый прямо в UI.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="start-button" class="button button-primary">Start</button>
+          <button id="stop-button" class="button button-secondary" disabled>Stop</button>
+        </div>
+      </header>
+
+      <main class="grid">
+        <section class="card">
+          <div class="section-heading">
+            <h2>Session State</h2>
+            <span id="connection-pill" class="pill pill-idle">idle</span>
+          </div>
+
+          <div class="metrics-grid">
+            <article class="metric">
+              <span class="metric-label">Mic</span>
+              <strong id="mic-status">off</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">WS</span>
+              <strong id="ws-status">disconnected</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">Latency</span>
+              <strong id="latency-status">pending</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">Knowledge</span>
+              <strong id="knowledge-status">empty</strong>
+            </article>
+          </div>
+
+          <canvas
+            id="waveform"
+            class="waveform"
+            width="960"
+            height="240"
+          ></canvas>
+        </section>
+
+        <section class="card">
+          <div class="section-heading">
+            <h2>Knowledge Markdown</h2>
+            <button id="apply-knowledge" class="button button-secondary" disabled>
+              Index Markdown
+            </button>
+          </div>
+          <textarea
+            id="knowledge-input"
+            class="knowledge-input"
+            placeholder="# Product FAQ&#10;&#10;Вставь сюда markdown-контекст для будущего RAG пайплайна."
+          ></textarea>
+          <p class="hint">
+            Утверждённый MVP-вариант ingestion: markdown-контекст вставляется в UI и
+            отправляется на backend, где индексируется в embeddings + Qdrant local.
+          </p>
+        </section>
+
+        <section class="card transcript-card">
+          <div class="section-heading">
+            <h2>Transcript / Events</h2>
+            <span id="session-id" class="mono">session: n/a</span>
+          </div>
+          <div id="events-log" class="events-log"></div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

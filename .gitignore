@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.local
+.DS_Store
+coverage/
+npm-debug.log*
+.qdrant/
+.amvera/
+.vercel/
+frontend/dist/
+backend/dist/
+docs/validation/artifacts/
