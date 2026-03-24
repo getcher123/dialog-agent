@@ -12,9 +12,10 @@ MVP-репозиторий для голосового агента с RAG по 
 На текущем этапе собран baseline и уже работает минимальный live pipeline:
 
 - backend healthcheck, live WebSocket runtime и telemetry breakdown endpoint;
-- frontend с кнопками `Start` / `Stop`, живым waveform микрофона, markdown-ingestion и mp3 playback ответа;
-- `raw PCM -> Deepgram -> OpenAI embeddings -> Qdrant local -> Groq -> ElevenLabs -> browser`;
-- provider smoke, latency smoke, streaming-comparison и `text-turn smoke` scripts;
+- frontend с voice mode, text mode, markdown-ingestion, progress bar индексации и streaming playback ответа;
+- `raw PCM -> Deepgram -> OpenAI embeddings -> Qdrant -> Groq -> ElevenLabs -> browser`;
+- backend и frontend уже умеют chunked TTS delivery: `audio.response.start -> audio.response.chunk* -> audio.response.end`;
+- provider smoke, latency smoke и `text-turn` / WS smoke проверки;
 - `.env.example` и Docker-first структура.
 
 ## Provider Baseline
@@ -27,6 +28,27 @@ MVP-репозиторий для голосового агента с RAG по 
 - Primary TTS model by current measurement: `eleven_turbo_v2_5`
 
 Текущие замеры и сравнения лежат в `docs/validation/`.
+
+## Current UX
+
+- `Start` нужен только для live microphone mode.
+- `Send Text` работает без включения микрофона.
+- `Index Markdown` тоже работает без `Start`: frontend сам открывает backend session без mic capture.
+- В knowledge card есть видимый progress bar с backend milestones:
+  - `queued`
+  - `chunking`
+  - `embedding`
+  - `storing`
+  - `completed`
+- Voice metrics расширены:
+  - `sttFinalizeMs`
+  - `voiceToAudioFirstByteMs`
+  - `voiceToAudioDeliveredMs`
+
+Важно:
+
+- новые voice latency метрики появляются только на voice-path;
+- для `text.turn` они не заполняются, потому что STT там не участвует.
 
 ## Prerequisites
 
@@ -63,6 +85,12 @@ npm run dev
 
 - `https://getcher123.github.io/dialog-agent/`
 
+На текущем состоянии Pages frontend уже совместим и со старым форматом ответа `audio.response`, и с новым chunked форматом:
+
+- `audio.response.start`
+- `audio.response.chunk`
+- `audio.response.end`
+
 Что нужно включить в GitHub:
 
 1. `Settings -> Pages -> Source = GitHub Actions`
@@ -90,6 +118,7 @@ Backend подготовлен под Amvera Docker deploy:
 - Amvera собирает root Docker image
 - backend слушает `PORT=3000`
 - health endpoint: `/health`
+- runtime transport: `ws-raw-pcm-live`
 
 Нужно задать env vars в Amvera:
 
@@ -106,10 +135,12 @@ Backend подготовлен под Amvera Docker deploy:
 - `QDRANT_COLLECTION`
 - `CORS_ORIGIN`
 
-Ограничение на сейчас:
+Замечания по deploy:
 
-- `amvera` CLI в этой среде не залогинен, поэтому я могу подготовить deploy-конфиг, но не могу завершить реальный publish без `amvera login`
-- backend требует доступный Qdrant endpoint; для Amvera нужно отдельно решить, где будет жить hosted Qdrant
+- Amvera git branch отслеживается как `master`, поэтому из локального `main` push делается как `HEAD -> master`;
+- после push может потребоваться `restart` или `rebuild`, если платформа держит старый runtime;
+- backend требует доступный `QDRANT_URL`;
+- frontend для Pages читает backend origin через `VITE_BACKEND_ORIGIN`.
 
 ## Build
 
@@ -128,9 +159,28 @@ npm start
 Смотри [.env.example](/mnt/c/Dialog-agent/.env.example). Секреты в репозиторий не добавляются.
 Для local dev backend по умолчанию работает на `3300`, чтобы не конфликтовать с уже занятым `3000`; для deploy порт задаётся через env, в Docker baseline оставлен `3000`.
 
+## Runtime Protocol Highlights
+
+Основные server events:
+
+- `transcript.partial`
+- `transcript.final`
+- `knowledge.indexing`
+- `knowledge.indexed`
+- `audio.response.start`
+- `audio.response.chunk`
+- `audio.response.end`
+- `pipeline.metrics`
+
+Это позволяет:
+
+- отдельно мерить retrieval / generation / TTS;
+- видеть прогресс knowledge indexing;
+- начинать playback до полной сборки всего MP3.
+
 ## Next Milestones
 
-- локально прогнать browser E2E по acceptance-сценариям RU/EN/not-found;
-- сохранить `ElevenLabs Scribe` как fallback/A-B STT path;
-- добавить interruption/barge-in behavior поверх текущего playback;
-- подготовить Docker/deploy smoke и post-deploy checks.
+- снять полноценный voice end-to-end latency smoke с реальным аудиовходом на проде;
+- добавить interruption / barge-in behavior поверх текущего streaming playback;
+- подготовить более явный post-deploy smoke для Amvera rollout;
+- при необходимости вынести shared WS protocol types в `shared/`.
