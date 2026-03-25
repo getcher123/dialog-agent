@@ -1,4 +1,5 @@
 import { env } from "../config/env.js";
+import { normalizeLanguageTag } from "../language.js";
 
 export interface TtsChunkInfo {
   sequence: number;
@@ -10,17 +11,23 @@ export interface TtsStreamResult {
   firstByteMs: number;
   totalMs: number;
   totalBytes: number;
+  language?: string;
+  voiceId: string;
+  modelId: string;
+  fallbackUsed: boolean;
 }
 
 interface StreamElevenLabsTtsOptions {
   text: string;
+  language?: string;
   onChunk?: (chunk: Buffer, info: TtsChunkInfo) => void;
 }
 
 export async function streamElevenLabsTts(
   options: StreamElevenLabsTtsOptions
 ): Promise<TtsStreamResult> {
-  if (!env.ELEVENLABS_API) {
+  const apiKey = env.ELEVENLABS_API;
+  if (!apiKey) {
     throw new Error("ELEVENLABS_API is not configured");
   }
 
@@ -28,21 +35,63 @@ export async function streamElevenLabsTts(
     throw new Error("ELEVENLABS_VOICE_ID is not configured");
   }
 
+  const requestedLanguage = normalizeLanguageTag(options.language);
+  const primaryProfile = resolveTtsProfile(requestedLanguage);
+
+  try {
+    return await streamWithProfile(primaryProfile, options, apiKey);
+  } catch (error) {
+    const fallbackProfile = resolveTtsProfile(undefined);
+
+    if (
+      !requestedLanguage ||
+      profilesMatch(primaryProfile, fallbackProfile) ||
+      !isRetriableLanguageRoutingError(error)
+    ) {
+      throw error;
+    }
+
+    const retried = await streamWithProfile(fallbackProfile, options, apiKey);
+    return {
+      ...retried,
+      fallbackUsed: true
+    };
+  }
+}
+
+interface TtsProfile {
+  language?: string;
+  voiceId: string;
+  modelId: string;
+  languageCode?: string;
+}
+
+async function streamWithProfile(
+  profile: TtsProfile,
+  options: StreamElevenLabsTtsOptions,
+  apiKey: string
+): Promise<TtsStreamResult> {
   const startedAt = Date.now();
+  const requestBody: Record<string, string> = {
+    text: options.text,
+    model_id: profile.modelId,
+    output_format: "mp3_44100_128"
+  };
+
+  if (profile.languageCode) {
+    requestBody.language_code = profile.languageCode;
+  }
+
   const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(env.ELEVENLABS_VOICE_ID)}/stream`,
+    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(profile.voiceId)}/stream`,
     {
       method: "POST",
       headers: {
-        "xi-api-key": env.ELEVENLABS_API,
+        "xi-api-key": apiKey,
         "Content-Type": "application/json",
         Accept: "audio/mpeg"
       },
-      body: JSON.stringify({
-        text: options.text,
-        model_id: env.ELEVENLABS_MODEL_ID,
-        output_format: "mp3_44100_128"
-      }),
+      body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(30000)
     }
   );
@@ -81,6 +130,57 @@ export async function streamElevenLabsTts(
     mimeType: "audio/mpeg",
     firstByteMs,
     totalMs: Date.now() - startedAt,
-    totalBytes
+    totalBytes,
+    language: profile.language,
+    voiceId: profile.voiceId,
+    modelId: profile.modelId,
+    fallbackUsed: false
   };
+}
+
+function resolveTtsProfile(language?: string): TtsProfile {
+  const normalized = normalizeLanguageTag(language);
+  const languageSuffix = normalized?.toUpperCase();
+  const configuredVoiceId =
+    pickNonEmptyEnv(languageSuffix ? `ELEVENLABS_VOICE_ID_${languageSuffix}` : undefined) ??
+    env.ELEVENLABS_VOICE_ID;
+  const configuredModelId =
+    pickNonEmptyEnv(languageSuffix ? `ELEVENLABS_MODEL_ID_${languageSuffix}` : undefined) ??
+    (normalized && normalized !== "en" ? env.ELEVENLABS_MULTILINGUAL_MODEL_ID : env.ELEVENLABS_MODEL_ID);
+
+  if (!configuredVoiceId) {
+    throw new Error("ELEVENLABS_VOICE_ID is not configured");
+  }
+
+  return {
+    language: normalized,
+    voiceId: configuredVoiceId,
+    modelId: configuredModelId,
+    languageCode: normalized && normalized !== "en" ? normalized : undefined
+  };
+}
+
+function profilesMatch(left: TtsProfile, right: TtsProfile): boolean {
+  return (
+    left.voiceId === right.voiceId &&
+    left.modelId === right.modelId &&
+    left.languageCode === right.languageCode
+  );
+}
+
+function isRetriableLanguageRoutingError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /ElevenLabs TTS failed:/i.test(error.message);
+}
+
+function pickNonEmptyEnv(name?: string): string | undefined {
+  if (!name) {
+    return undefined;
+  }
+
+  const value = process.env[name]?.trim();
+  return value || undefined;
 }

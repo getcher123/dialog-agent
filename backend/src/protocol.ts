@@ -30,6 +30,14 @@ export type ServerEvent =
       sessionId: string;
     }
   | {
+      type: "session.language";
+      sessionId: string;
+      language: string;
+      source: "stt" | "text" | "session" | "default";
+      changed: boolean;
+      detail: string;
+    }
+  | {
       type: "knowledge.indexing";
       sessionId: string;
       status: "started" | "completed" | "failed";

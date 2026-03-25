@@ -8,6 +8,7 @@ import type { RawData } from "ws";
 import type WebSocket from "ws";
 
 import { env } from "./config/env.js";
+import { getLanguageDisplayName, inferLanguageFromText, normalizeLanguageTag } from "./language.js";
 import { log } from "./logging.js";
 import type { ClientEvent, ServerEvent } from "./protocol.js";
 import {
@@ -171,7 +172,8 @@ wsServer.on("connection", (connection) => {
     processing: Promise.resolve(),
     deepgramReady: false,
     pendingAudioChunks: [],
-    lastAudioChunkAt: undefined
+    lastAudioChunkAt: undefined,
+    detectedLanguage: undefined
   });
 
   log("ws.connection.opened", { sessionId: session.id });
@@ -275,9 +277,28 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
         sessionId: started.id
       });
 
-      void startSpeechRecognition(runtime, send, (transcript, latencyContext) => {
+      void startSpeechRecognition(runtime, send, (transcript, context) => {
         sessionManager.setLastUserTranscript(connection, transcript);
-        queueAssistantResponse(runtime, transcript, send, latencyContext);
+        const languageSource = context.detectedLanguage
+          ? "stt"
+          : runtime.detectedLanguage
+            ? "session"
+            : "default";
+        const requestedLanguage = announceSessionLanguage(
+          runtime,
+          send,
+          context.detectedLanguage ?? runtime.detectedLanguage,
+          languageSource,
+          context.detectedLanguage
+            ? `Speech finalized. Dominant language detected: ${getLanguageDisplayName(context.detectedLanguage)}.`
+            : "Speech finalized. Reusing the current session language for the response."
+        );
+
+        queueAssistantResponse(runtime, transcript, send, {
+          latencyContext: context,
+          requestedLanguage,
+          languageSource
+        });
       });
 
       send(connection, {
@@ -380,6 +401,26 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
       }
 
       sessionManager.setLastUserTranscript(connection, text);
+      const inferredTextLanguage = inferLanguageFromText(text);
+      const languageSource = inferredTextLanguage
+        ? "text"
+        : runtime.detectedLanguage
+          ? "session"
+          : "default";
+      const requestedLanguage =
+        announceSessionLanguage(
+          runtime,
+          send,
+          inferredTextLanguage ?? runtime.detectedLanguage,
+          languageSource,
+          inferredTextLanguage
+            ? `Text turn language inferred as ${getLanguageDisplayName(inferredTextLanguage)}.`
+            : runtime.detectedLanguage
+              ? `Text turn is ambiguous. Reusing session language ${getLanguageDisplayName(
+                  runtime.detectedLanguage
+                )}.`
+              : "Text turn language is ambiguous. Falling back to the default response language."
+        ) ?? runtime.detectedLanguage;
 
       send(connection, {
         type: "transcript.final",
@@ -395,7 +436,10 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
         detail: "Text message received. Running retrieval, generation and speech synthesis."
       });
 
-      queueAssistantResponse(runtime, text, send);
+      queueAssistantResponse(runtime, text, send, {
+        requestedLanguage,
+        languageSource
+      });
       return;
     }
 
@@ -418,6 +462,33 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
 
 function send(connection: WebSocket, event: ServerEvent): void {
   connection.send(JSON.stringify(event));
+}
+
+function announceSessionLanguage(
+  runtime: RuntimeSessionState,
+  sendEvent: typeof send,
+  nextLanguage: string | undefined,
+  source: "stt" | "text" | "session" | "default",
+  detail: string
+): string | undefined {
+  const normalized = normalizeLanguageTag(nextLanguage);
+  const previous = runtime.detectedLanguage;
+  const changed = normalized !== previous;
+
+  if (normalized) {
+    runtime.detectedLanguage = normalized;
+  }
+
+  sendEvent(runtime.connection, {
+    type: "session.language",
+    sessionId: runtime.sessionId,
+    language: normalized ?? previous ?? "ru",
+    source,
+    changed,
+    detail
+  });
+
+  return normalized ?? previous;
 }
 
 function measurePayloadBytes(payload: RawData): number {

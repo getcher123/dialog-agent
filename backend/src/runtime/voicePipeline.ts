@@ -1,5 +1,10 @@
 import type WebSocket from "ws";
 
+import {
+  getLanguageDisplayName,
+  inferLanguageFromText,
+  normalizeLanguageTag
+} from "../language.js";
 import { log } from "../logging.js";
 import type { ServerEvent } from "../protocol.js";
 import { connectDeepgramStream } from "../providers/deepgram.js";
@@ -26,6 +31,7 @@ export interface RuntimeSessionState {
   deepgramReady: boolean;
   pendingAudioChunks: Buffer[];
   lastAudioChunkAt?: number;
+  detectedLanguage?: string;
 }
 
 type SendFn = (connection: WebSocket, event: ServerEvent) => void;
@@ -34,6 +40,17 @@ const SHARED_KNOWLEDGE_SOURCE = "shared-ui-knowledge";
 export interface VoiceLatencyContext {
   voiceInputEndedAt: number;
   transcriptFinalizedAt: number;
+}
+
+export interface AssistantTurnContext {
+  latencyContext?: VoiceLatencyContext;
+  requestedLanguage?: string;
+  languageSource?: "stt" | "text" | "session" | "default";
+}
+
+export interface FinalTranscriptContext extends VoiceLatencyContext {
+  detectedLanguage?: string;
+  detectedLanguages: string[];
 }
 
 interface KnowledgeIndexingProgress {
@@ -45,7 +62,7 @@ interface KnowledgeIndexingProgress {
 export async function startSpeechRecognition(
   runtime: RuntimeSessionState,
   send: SendFn,
-  onFinalTranscript: (transcript: string, latencyContext: VoiceLatencyContext) => void
+  onFinalTranscript: (transcript: string, context: FinalTranscriptContext) => void
 ): Promise<void> {
   runtime.deepgram?.close();
   runtime.deepgramReady = false;
@@ -81,12 +98,13 @@ export async function startSpeechRecognition(
         text
       });
     },
-    onFinalSegment: (text, speechFinal) => {
+    onFinalSegment: (segment) => {
+      const text = segment.text;
       if (text) {
         runtime.finalSegments.push(text);
       }
 
-      if (!speechFinal) {
+      if (!segment.speechFinal) {
         return;
       }
 
@@ -115,7 +133,9 @@ export async function startSpeechRecognition(
 
       onFinalTranscript(transcript, {
         voiceInputEndedAt,
-        transcriptFinalizedAt
+        transcriptFinalizedAt,
+        detectedLanguage: normalizeLanguageTag(segment.dominantLanguage),
+        detectedLanguages: segment.languages
       });
     },
     onError: (message) => {
@@ -183,11 +203,14 @@ export function queueAssistantResponse(
   runtime: RuntimeSessionState,
   transcript: string,
   send: SendFn,
-  latencyContext?: VoiceLatencyContext
+  context?: AssistantTurnContext
 ): void {
   runtime.processing = runtime.processing
     .then(async () => {
       const trace = new PipelineTrace(runtime.sessionId, "voice.utterance");
+      const requestedLanguage = resolveResponseLanguage(runtime, transcript, context?.requestedLanguage);
+      const languageSource = context?.languageSource ?? (requestedLanguage ? "session" : "default");
+      const languageLabel = requestedLanguage ? getLanguageDisplayName(requestedLanguage) : "user language";
 
       try {
         const embeddingStartedAt = Date.now();
@@ -204,7 +227,7 @@ export function queueAssistantResponse(
 
         const generationStartedAt = Date.now();
         const completion = await streamGroqCompletion({
-          systemPrompt: buildSystemPrompt(matches),
+          systemPrompt: buildSystemPrompt(matches, requestedLanguage),
           userPrompt: transcript,
           onDelta: (delta) => {
             send(runtime.connection, {
@@ -232,6 +255,13 @@ export function queueAssistantResponse(
         let audioStreamCompletedAt: number | undefined;
 
         send(runtime.connection, {
+          type: "server.status",
+          sessionId: runtime.sessionId,
+          phase: "processing",
+          detail: `Generating ${languageLabel} speech output. Language source: ${languageSource}.`
+        });
+
+        send(runtime.connection, {
           type: "audio.response.start",
           sessionId: runtime.sessionId,
           mimeType: "audio/mpeg"
@@ -239,6 +269,7 @@ export function queueAssistantResponse(
 
         const streamedTts = await streamElevenLabsTts({
           text: completion.text,
+          language: requestedLanguage,
           onChunk: (chunk, info) => {
             const chunkSentAt = Date.now();
 
@@ -267,21 +298,24 @@ export function queueAssistantResponse(
           totalBytes: streamedTts.totalBytes
         });
 
-        const sttFinalizeMs = latencyContext
-          ? Math.max(0, latencyContext.transcriptFinalizedAt - latencyContext.voiceInputEndedAt)
+        const sttFinalizeMs = context?.latencyContext
+          ? Math.max(
+              0,
+              context.latencyContext.transcriptFinalizedAt - context.latencyContext.voiceInputEndedAt
+            )
           : undefined;
-        const voiceToAudioFirstByteMs = latencyContext
+        const voiceToAudioFirstByteMs = context?.latencyContext
           ? Math.max(
               0,
               (audioFirstChunkSentAt ?? audioStreamCompletedAt ?? Date.now()) -
-                latencyContext.voiceInputEndedAt
+                context.latencyContext.voiceInputEndedAt
             )
           : undefined;
-        const voiceToAudioDeliveredMs = latencyContext
+        const voiceToAudioDeliveredMs = context?.latencyContext
           ? Math.max(
               0,
               (audioStreamCompletedAt ?? audioFirstChunkSentAt ?? Date.now()) -
-                latencyContext.voiceInputEndedAt
+                context.latencyContext.voiceInputEndedAt
             )
           : undefined;
 
@@ -344,15 +378,20 @@ function buildSystemPrompt(
   matches: Array<{
     ordinal: number;
     text: string;
-  }>
+  }>,
+  responseLanguage?: string
 ): string {
   const context = matches.length
     ? matches.map((match) => `[chunk-${match.ordinal + 1}]\n${match.text}`).join("\n\n")
     : "Контекст не найден.";
+  const normalizedLanguage = normalizeLanguageTag(responseLanguage);
+  const languageInstruction = normalizedLanguage
+    ? `Критично: итоговый ответ дай на ${getLanguageDisplayName(normalizedLanguage)} языке (код: ${normalizedLanguage}). Если пользователь смешивает языки, используй этот язык как основной для всего ответа.`
+    : "Отвечай кратко и на языке пользователя.";
 
   return [
     "Ты отвечаешь как голосовой RAG-ассистент.",
-    "Отвечай кратко и на языке пользователя.",
+    languageInstruction,
     "Используй контекст ниже, если он релевантен.",
     "Если контекста не хватает, скажи об этом прямо.",
     "Если ссылаешься на источник, используй формат [chunk-N].",
@@ -360,4 +399,17 @@ function buildSystemPrompt(
     "Контекст:",
     context
   ].join("\n");
+}
+
+function resolveResponseLanguage(
+  runtime: RuntimeSessionState,
+  transcript: string,
+  preferredLanguage?: string
+): string | undefined {
+  return (
+    normalizeLanguageTag(preferredLanguage) ??
+    runtime.detectedLanguage ??
+    inferLanguageFromText(transcript) ??
+    "ru"
+  );
 }

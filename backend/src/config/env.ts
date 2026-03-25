@@ -28,6 +28,7 @@ const envSchema = z.object({
   QDRANT_STORAGE_PATH: z.string().default("./.qdrant"),
   ELEVENLABS_VOICE_ID: z.string().optional(),
   ELEVENLABS_MODEL_ID: z.string().default("eleven_turbo_v2_5"),
+  ELEVENLABS_MULTILINGUAL_MODEL_ID: z.string().default("eleven_multilingual_v2"),
   RENDER_EXTERNAL_URL: z.string().optional()
 });
 

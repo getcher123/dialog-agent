@@ -4,6 +4,14 @@ type ServerEvent =
   | { type: "connection.ready"; sessionId: string }
   | { type: "session.started"; sessionId: string }
   | {
+      type: "session.language";
+      sessionId: string;
+      language: string;
+      source: "stt" | "text" | "session" | "default";
+      changed: boolean;
+      detail: string;
+    }
+  | {
       type: "knowledge.indexing";
       sessionId: string;
       status: "started" | "completed" | "failed";
@@ -370,6 +378,13 @@ function handleServerEvent(event: ServerEvent): void {
         ? "Voice trigger is automatic: speak, pause briefly, then inference starts."
         : "Connection is ready for text dialogue and knowledge indexing. Press Start only when you want live microphone mode.";
       addEventRow("Server", `Session started: ${event.sessionId}`);
+      return;
+
+    case "session.language":
+      addEventRow(
+        "Language",
+        `${event.language} via ${event.source}${event.changed ? " (updated)" : ""}. ${event.detail}`
+      );
       return;
 
     case "knowledge.indexing":
