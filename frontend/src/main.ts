@@ -61,6 +61,7 @@ type ServerEvent =
       traceId: string;
       totalMs: number;
       firstByteMs?: number;
+      elevenlabsTtsFirstByteMs?: number;
       sttFinalizeMs?: number;
       voiceToAudioFirstByteMs?: number;
       voiceToAudioDeliveredMs?: number;
@@ -76,8 +77,10 @@ const startButton = getRequiredElement<HTMLButtonElement>("#start-button");
 const stopButton = getRequiredElement<HTMLButtonElement>("#stop-button");
 const applyKnowledgeButton = getRequiredElement<HTMLButtonElement>("#apply-knowledge");
 const sendTextButton = getRequiredElement<HTMLButtonElement>("#send-text");
+const resetRagPromptButton = getRequiredElement<HTMLButtonElement>("#reset-rag-prompt");
 const knowledgeInput = getRequiredElement<HTMLTextAreaElement>("#knowledge-input");
 const textMessageInput = getRequiredElement<HTMLTextAreaElement>("#text-message-input");
+const ragPromptInput = getRequiredElement<HTMLTextAreaElement>("#rag-prompt-input");
 const eventsLog = getRequiredElement<HTMLDivElement>("#events-log");
 const chatLog = getRequiredElement<HTMLDivElement>("#chat-log");
 const sessionIdLabel = getRequiredElement<HTMLSpanElement>("#session-id");
@@ -85,7 +88,14 @@ const connectionPill = getRequiredElement<HTMLSpanElement>("#connection-pill");
 const micStatus = getRequiredElement<HTMLElement>("#mic-status");
 const wsStatus = getRequiredElement<HTMLElement>("#ws-status");
 const latencyStatus = getRequiredElement<HTMLElement>("#latency-status");
+const sttLatencyStatus = getRequiredElement<HTMLElement>("#stt-latency-status");
+const openaiEmbeddingsStatus = getRequiredElement<HTMLElement>("#openai-embeddings-status");
+const qdrantQueryStatus = getRequiredElement<HTMLElement>("#qdrant-query-status");
+const groqCompletionStatus = getRequiredElement<HTMLElement>("#groq-completion-status");
+const elevenlabsFirstByteStatus = getRequiredElement<HTMLElement>("#elevenlabs-first-byte-status");
+const voiceFirstAudioStatus = getRequiredElement<HTMLElement>("#voice-first-audio-status");
 const knowledgeStatus = getRequiredElement<HTMLElement>("#knowledge-status");
+const ragPromptStatus = getRequiredElement<HTMLElement>("#rag-prompt-status");
 const triggerStatus = getRequiredElement<HTMLElement>("#trigger-status");
 const processingStatus = getRequiredElement<HTMLElement>("#processing-status");
 const pipelineHint = getRequiredElement<HTMLElement>("#pipeline-hint");
@@ -116,6 +126,7 @@ let scriptProcessor: ScriptProcessorNode | null = null;
 let microphoneSource: MediaStreamAudioSourceNode | null = null;
 let silentGain: GainNode | null = null;
 let waveformFrame = 0;
+let idleWavePhase = 0;
 let lastPingAt = 0;
 let activeAudio: HTMLAudioElement | null = null;
 let activeAudioUrl: string | null = null;
@@ -123,6 +134,9 @@ let activeAudioStream: AudioStreamPlayback | null = null;
 let isIndexingKnowledge = false;
 let assistantPartialBubble: HTMLElement | null = null;
 let socketConnectPromise: Promise<void> | null = null;
+let ragPromptSyncTimer: number | null = null;
+let lastSyncedRagPrompt = normalizePrompt(ragPromptInput.value);
+const defaultRagPrompt = lastSyncedRagPrompt;
 
 startButton.addEventListener("click", () => {
   void startSession();
@@ -140,8 +154,19 @@ sendTextButton.addEventListener("click", () => {
   void sendTextTurn();
 });
 
+resetRagPromptButton.addEventListener("click", () => {
+  ragPromptInput.value = defaultRagPrompt;
+  setRagPromptStatus(socket?.readyState === WebSocket.OPEN ? "Syncing..." : "Local default");
+  scheduleRagPromptSync(true);
+});
+
 knowledgeInput.addEventListener("input", () => {
   updateKnowledgeUiState(isIndexingKnowledge, knowledgeStatus.textContent ?? "empty");
+});
+
+ragPromptInput.addEventListener("input", () => {
+  setRagPromptStatus(socket?.readyState === WebSocket.OPEN ? "Syncing..." : "Saved locally");
+  scheduleRagPromptSync(false);
 });
 
 textMessageInput.addEventListener("keydown", (event) => {
@@ -171,6 +196,7 @@ async function startSession(): Promise<void> {
 
     setupWaveform(mediaStream);
     await ensureSocketConnected();
+    syncRagPromptToServer();
     if (hadOpenSocket) {
       socket?.send(
         JSON.stringify({
@@ -215,7 +241,7 @@ function stopSession(): void {
   microphoneSource = null;
   silentGain = null;
   cancelAnimationFrame(waveformFrame);
-  drawIdleWaveform();
+  startIdleWaveform();
   sessionId = "n/a";
   assistantPartialBubble = null;
   updateSessionId();
@@ -223,6 +249,7 @@ function stopSession(): void {
   micStatus.textContent = "off";
   wsStatus.textContent = "disconnected";
   latencyStatus.textContent = "pending";
+  resetLatencyBreakdown();
   triggerStatus.textContent = "not armed";
   processingStatus.textContent = "idle";
   pipelineHint.textContent = "Press Start. Trigger happens automatically after speech pause is detected.";
@@ -264,6 +291,7 @@ async function sendTextTurn(): Promise<void> {
   }
 
   await ensureSocketConnected();
+  syncRagPromptToServer();
   textMessageInput.value = "";
   socket?.send(
     JSON.stringify({
@@ -295,6 +323,7 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
     sendTextButton.disabled = false;
     updateKnowledgeUiState(false, knowledgeInput.value.trim() ? "shared / stale" : "empty");
     addEventRow("Client", `WS connected: ${url}`);
+    syncRagPromptToServer(true);
 
     socket?.send(
       JSON.stringify({
@@ -426,7 +455,6 @@ function handleServerEvent(event: ServerEvent): void {
 
     case "client.pong": {
       const latency = Math.max(0, Date.now() - lastPingAt);
-      latencyStatus.textContent = `${latency} ms`;
       addEventRow("Metrics", `Initial WS RTT ${latency} ms`);
       return;
     }
@@ -469,9 +497,13 @@ function handleServerEvent(event: ServerEvent): void {
 
     case "pipeline.metrics":
       latencyStatus.textContent = `${event.totalMs} ms`;
+      updateLatencyBreakdown(event);
       processingStatus.textContent = "done";
       {
         const extras = [
+          event.elevenlabsTtsFirstByteMs !== undefined
+            ? `elevenlabsTtsFirstByte=${event.elevenlabsTtsFirstByteMs}ms`
+            : null,
           event.sttFinalizeMs !== undefined ? `sttFinalize=${event.sttFinalizeMs}ms` : null,
           event.voiceToAudioFirstByteMs !== undefined
             ? `voiceToAudioFirstByte=${event.voiceToAudioFirstByteMs}ms`
@@ -532,6 +564,32 @@ function reflectPipelineStatus(phase: string, detail: string): void {
   }
 }
 
+function updateLatencyBreakdown(
+  event: Extract<ServerEvent, { type: "pipeline.metrics" }>
+): void {
+  const stages = new Map(event.stages.map((stage) => [stage.name, stage.durationMs]));
+
+  sttLatencyStatus.textContent = formatLatency(event.sttFinalizeMs, "n/a");
+  openaiEmbeddingsStatus.textContent = formatLatency(stages.get("openai_embeddings"));
+  qdrantQueryStatus.textContent = formatLatency(stages.get("qdrant_query"));
+  groqCompletionStatus.textContent = formatLatency(stages.get("groq_completion"));
+  elevenlabsFirstByteStatus.textContent = formatLatency(event.elevenlabsTtsFirstByteMs);
+  voiceFirstAudioStatus.textContent = formatLatency(event.voiceToAudioFirstByteMs, "n/a");
+}
+
+function resetLatencyBreakdown(): void {
+  sttLatencyStatus.textContent = "pending";
+  openaiEmbeddingsStatus.textContent = "pending";
+  qdrantQueryStatus.textContent = "pending";
+  groqCompletionStatus.textContent = "pending";
+  elevenlabsFirstByteStatus.textContent = "pending";
+  voiceFirstAudioStatus.textContent = "pending";
+}
+
+function formatLatency(value: number | undefined, fallback = "pending"): string {
+  return value !== undefined ? `${value} ms` : fallback;
+}
+
 function addEventRow(title: string, body: string): void {
   const row = document.createElement("article");
   row.className = "event-row";
@@ -582,6 +640,48 @@ function updateKnowledgeUiState(isIndexing: boolean, label: string): void {
   knowledgeStatus.textContent = label;
   applyKnowledgeButton.disabled = isIndexing || !knowledgeInput.value.trim();
   applyKnowledgeButton.textContent = isIndexing ? "Indexing..." : "Index Markdown";
+}
+
+function scheduleRagPromptSync(force: boolean): void {
+  if (ragPromptSyncTimer !== null) {
+    window.clearTimeout(ragPromptSyncTimer);
+  }
+
+  ragPromptSyncTimer = window.setTimeout(() => {
+    ragPromptSyncTimer = null;
+    syncRagPromptToServer(force);
+  }, force ? 0 : 280);
+}
+
+function syncRagPromptToServer(force = false): void {
+  const prompt = normalizePrompt(ragPromptInput.value);
+
+  if (!force && prompt === lastSyncedRagPrompt) {
+    setRagPromptStatus(prompt === defaultRagPrompt ? "Local default" : "Synced");
+    return;
+  }
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    setRagPromptStatus(prompt === defaultRagPrompt ? "Local default" : "Saved locally");
+    return;
+  }
+
+  socket.send(
+    JSON.stringify({
+      type: "prompt.set",
+      prompt
+    })
+  );
+  lastSyncedRagPrompt = prompt;
+  setRagPromptStatus(prompt === defaultRagPrompt ? "Default synced" : "Synced");
+}
+
+function setRagPromptStatus(label: string): void {
+  ragPromptStatus.textContent = label;
+}
+
+function normalizePrompt(value: string): string {
+  return value.trim().replace(/\r\n/g, "\n");
 }
 
 function updateKnowledgeProgress(percent: number, detail: string, label?: string): void {
@@ -860,12 +960,13 @@ function setupWaveform(stream: MediaStream): void {
     socket.send(buffer);
   };
 
+  cancelAnimationFrame(waveformFrame);
   drawWaveform();
 }
 
 function drawWaveform(): void {
   if (!analyser) {
-    drawIdleWaveform();
+    startIdleWaveform();
     return;
   }
 
@@ -916,17 +1017,46 @@ function drawIdleWaveform(): void {
   context.clearRect(0, 0, waveform.width, waveform.height);
   context.fillStyle = "#12221d";
   context.fillRect(0, 0, waveform.width, waveform.height);
-  context.strokeStyle = "rgba(245, 199, 141, 0.45)";
-  context.lineWidth = 2;
+  context.strokeStyle = "rgba(255, 248, 238, 0.22)";
+  context.lineWidth = 1.5;
   context.beginPath();
   context.moveTo(0, waveform.height / 2);
 
-  for (let x = 0; x <= waveform.width; x += 24) {
-    const y = waveform.height / 2 + Math.sin(x / 18) * 8;
+  for (let x = 0; x <= waveform.width; x += 18) {
+    context.lineTo(x, waveform.height / 2);
+  }
+
+  context.stroke();
+  context.strokeStyle = "rgba(255, 248, 238, 0.96)";
+  context.lineWidth = 4;
+  context.shadowColor = "rgba(245, 199, 141, 0.42)";
+  context.shadowBlur = 22;
+  context.beginPath();
+  context.moveTo(0, waveform.height / 2);
+
+  for (let x = 0; x <= waveform.width; x += 16) {
+    const y = waveform.height / 2 + Math.sin(x / 28 + idleWavePhase) * 12;
     context.lineTo(x, y);
   }
 
   context.stroke();
+  context.shadowBlur = 0;
+}
+
+function startIdleWaveform(): void {
+  cancelAnimationFrame(waveformFrame);
+
+  const renderIdleWaveform = () => {
+    if (analyser) {
+      return;
+    }
+
+    drawIdleWaveform();
+    idleWavePhase += 0.06;
+    waveformFrame = requestAnimationFrame(renderIdleWaveform);
+  };
+
+  renderIdleWaveform();
 }
 
 function getRequiredElement<T extends HTMLElement>(selector: string): T {
@@ -948,6 +1078,6 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
-drawIdleWaveform();
+startIdleWaveform();
 sendTextButton.disabled = false;
 updateKnowledgeUiState(false, knowledgeInput.value.trim() ? "shared / stale" : "empty");

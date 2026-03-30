@@ -8,6 +8,10 @@ export type ClientEvent =
       markdown: string;
     }
   | {
+      type: "prompt.set";
+      prompt: string;
+    }
+  | {
       type: "text.turn";
       text: string;
     }
@@ -98,6 +102,7 @@ export type ServerEvent =
       traceId: string;
       totalMs: number;
       firstByteMs?: number;
+      elevenlabsTtsFirstByteMs?: number;
       sttFinalizeMs?: number;
       voiceToAudioFirstByteMs?: number;
       voiceToAudioDeliveredMs?: number;

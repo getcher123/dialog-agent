@@ -13,21 +13,114 @@
       <header class="hero">
         <div>
           <p class="eyebrow">Voice Agent RAG MVP</p>
-          <h1>Realtime voice agent with visible trigger and shared knowledge</h1>
+          <h1>Realtime voice agent with shared knowledge</h1>
           <p class="hero-copy">
             Голосовой триггер здесь автоматический: говорите фразу и делайте короткую паузу.
             После паузы backend запускает STT, retrieval, LLM и TTS. Markdown knowledge
             индексируется в общий Qdrant-контур и сохраняется для следующих сессий.
           </p>
-        </div>
-        <div class="hero-actions">
-          <button id="start-button" class="button button-primary">Start</button>
-          <button id="stop-button" class="button button-secondary" disabled>Stop</button>
+          <div class="hero-controls">
+            <button id="start-button" class="button button-primary">Start</button>
+            <button id="stop-button" class="button button-secondary" disabled>Stop</button>
+          </div>
         </div>
       </header>
 
       <main class="grid">
-        <section class="card">
+        <section class="card waveform-card">
+          <div class="waveform-stage">
+            <canvas
+              id="waveform"
+              class="waveform"
+              width="960"
+              height="240"
+            ></canvas>
+
+            <p
+              id="pipeline-hint"
+              class="waveform-banner"
+              style="
+                position: absolute;
+                left: 18px;
+                right: 18px;
+                bottom: 18px;
+                z-index: 2;
+                margin: 0;
+                color: rgba(255, 248, 238, 0.94);
+              "
+            >
+              Press Start. Trigger happens automatically after speech pause is detected.
+            </p>
+          </div>
+
+          <div class="waveform-chat-shell">
+            <div class="section-heading">
+              <h2>Text Dialogue</h2>
+              <span class="mono">Ctrl/Cmd + Enter to send</span>
+            </div>
+            <div id="chat-log" class="chat-log"></div>
+            <div class="text-composer">
+              <textarea
+                id="text-message-input"
+                class="text-message-input"
+                placeholder="Напиши сообщение сюда, чтобы протестировать тот же RAG-контур без микрофона."
+              ></textarea>
+              <button id="send-text" class="button button-primary" disabled>Send Text</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="editor-pair">
+          <article class="card">
+            <div class="section-heading">
+              <h2>RAG Prompt</h2>
+              <button id="reset-rag-prompt" class="button button-secondary">Reset Prompt</button>
+            </div>
+            <textarea id="rag-prompt-input" class="knowledge-input prompt-input">
+Ты отвечаешь как голосовой RAG-ассистент.
+Используй контекст ниже, если он релевантен.
+Если контекста не хватает, скажи об этом прямо.
+Если ссылаешься на источник, используй формат [chunk-N].</textarea
+            >
+            <div class="prompt-meta">
+              <strong id="rag-prompt-status">Local default</strong>
+              <span class="mono">Applies to subsequent turns immediately</span>
+            </div>
+            <p class="hint">
+              Этот prompt можно менять на лету во время тестирования. Языковой роутинг и
+              системные latency-метрики backend всё равно добавляет отдельно.
+            </p>
+          </article>
+
+          <article class="card">
+            <div class="section-heading">
+              <h2>Knowledge Markdown</h2>
+              <button id="apply-knowledge" class="button button-secondary" disabled>
+                Index Markdown
+              </button>
+            </div>
+            <textarea
+              id="knowledge-input"
+              class="knowledge-input"
+              placeholder="# Product FAQ&#10;&#10;Вставь сюда markdown-контекст для будущего RAG пайплайна."
+            ></textarea>
+            <div class="knowledge-progress-shell" aria-live="polite">
+              <div class="knowledge-progress-meta">
+                <strong id="knowledge-progress-label">Idle</strong>
+                <span id="knowledge-progress-value" class="mono">0%</span>
+              </div>
+              <div class="knowledge-progress-track">
+                <div id="knowledge-progress-fill" class="knowledge-progress-fill"></div>
+              </div>
+            </div>
+            <p class="hint">
+              Индекс общий: после успешной индексации этот knowledge доступен следующим
+              сессиям, пока вы не замените его новым markdown.
+            </p>
+          </article>
+        </section>
+
+        <section class="card session-card">
           <div class="section-heading">
             <h2>Session State</h2>
             <span id="connection-pill" class="pill pill-idle">idle</span>
@@ -43,7 +136,7 @@
               <strong id="ws-status">disconnected</strong>
             </article>
             <article class="metric">
-              <span class="metric-label">Latency</span>
+              <span class="metric-label">Pipeline Total</span>
               <strong id="latency-status">pending</strong>
             </article>
             <article class="metric">
@@ -60,58 +153,36 @@
             </article>
           </div>
 
-          <p id="pipeline-hint" class="status-banner">
-            Press Start. Trigger happens automatically after speech pause is detected.
-          </p>
-
-          <canvas
-            id="waveform"
-            class="waveform"
-            width="960"
-            height="240"
-          ></canvas>
-        </section>
-
-        <section class="card">
-          <div class="section-heading">
-            <h2>Knowledge Markdown</h2>
-            <button id="apply-knowledge" class="button button-secondary" disabled>
-              Index Markdown
-            </button>
+          <div class="section-heading section-heading-sub">
+            <h2>Latency Breakdown</h2>
+            <span class="mono">per completed turn</span>
           </div>
-          <textarea
-            id="knowledge-input"
-            class="knowledge-input"
-            placeholder="# Product FAQ&#10;&#10;Вставь сюда markdown-контекст для будущего RAG пайплайна."
-          ></textarea>
-          <div class="knowledge-progress-shell" aria-live="polite">
-            <div class="knowledge-progress-meta">
-              <strong id="knowledge-progress-label">Idle</strong>
-              <span id="knowledge-progress-value" class="mono">0%</span>
-            </div>
-            <div class="knowledge-progress-track">
-              <div id="knowledge-progress-fill" class="knowledge-progress-fill"></div>
-            </div>
-          </div>
-          <p class="hint">
-            Индекс общий: после успешной индексации этот knowledge доступен следующим
-            сессиям, пока вы не замените его новым markdown.
-          </p>
-        </section>
 
-        <section class="card">
-          <div class="section-heading">
-            <h2>Text Dialogue</h2>
-            <span class="mono">Ctrl/Cmd + Enter to send</span>
-          </div>
-          <div id="chat-log" class="chat-log"></div>
-          <div class="text-composer">
-            <textarea
-              id="text-message-input"
-              class="text-message-input"
-              placeholder="Напиши сообщение сюда, чтобы протестировать тот же RAG-контур без микрофона."
-            ></textarea>
-            <button id="send-text" class="button button-primary" disabled>Send Text</button>
+          <div class="metrics-grid metrics-grid-latency">
+            <article class="metric">
+              <span class="metric-label">STT latency</span>
+              <strong id="stt-latency-status">pending</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">openai_embeddings</span>
+              <strong id="openai-embeddings-status">pending</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">qdrant_query</span>
+              <strong id="qdrant-query-status">pending</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">groq_completion</span>
+              <strong id="groq-completion-status">pending</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">elevenlabs_tts</span>
+              <strong id="elevenlabs-first-byte-status">pending</strong>
+            </article>
+            <article class="metric">
+              <span class="metric-label">Voice → First Audio</span>
+              <strong id="voice-first-audio-status">pending</strong>
+            </article>
           </div>
         </section>
 

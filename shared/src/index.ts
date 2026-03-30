@@ -8,6 +8,10 @@ export type ClientEvent =
       markdown: string;
     }
   | {
+      type: "prompt.set";
+      prompt: string;
+    }
+  | {
       type: "client.ping";
       at: number;
     }

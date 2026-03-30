@@ -25,6 +25,7 @@ export interface RuntimeSessionState {
   connection: WebSocket;
   sampleRate: number;
   knowledgeMarkdown: string;
+  ragPrompt: string;
   finalSegments: string[];
   processing: Promise<void>;
   deepgram?: WebSocket;
@@ -36,6 +37,12 @@ export interface RuntimeSessionState {
 
 type SendFn = (connection: WebSocket, event: ServerEvent) => void;
 const SHARED_KNOWLEDGE_SOURCE = "shared-ui-knowledge";
+export const DEFAULT_RAG_PROMPT = [
+  "Ты отвечаешь как голосовой RAG-ассистент.",
+  "Используй контекст ниже, если он релевантен.",
+  "Если контекста не хватает, скажи об этом прямо.",
+  "Если ссылаешься на источник, используй формат [chunk-N]."
+].join("\n");
 
 export interface VoiceLatencyContext {
   voiceInputEndedAt: number;
@@ -211,6 +218,11 @@ export function queueAssistantResponse(
       const requestedLanguage = resolveResponseLanguage(runtime, transcript, context?.requestedLanguage);
       const languageSource = context?.languageSource ?? (requestedLanguage ? "session" : "default");
       const languageLabel = requestedLanguage ? getLanguageDisplayName(requestedLanguage) : "user language";
+      let completionFirstByteMs: number | undefined;
+      let elevenlabsTtsFirstByteMs: number | undefined;
+      let sttFinalizeMs: number | undefined;
+      let voiceToAudioFirstByteMs: number | undefined;
+      let voiceToAudioDeliveredMs: number | undefined;
 
       try {
         const embeddingStartedAt = Date.now();
@@ -227,7 +239,7 @@ export function queueAssistantResponse(
 
         const generationStartedAt = Date.now();
         const completion = await streamGroqCompletion({
-          systemPrompt: buildSystemPrompt(matches, requestedLanguage),
+          systemPrompt: buildSystemPrompt(matches, requestedLanguage, runtime.ragPrompt),
           userPrompt: transcript,
           onDelta: (delta) => {
             send(runtime.connection, {
@@ -242,6 +254,7 @@ export function queueAssistantResponse(
           firstByteMs: completion.firstByteMs,
           characters: completion.text.length
         });
+        completionFirstByteMs = completion.firstByteMs;
 
         send(runtime.connection, {
           type: "transcript.final",
@@ -290,6 +303,7 @@ export function queueAssistantResponse(
           firstByteMs: streamedTts.firstByteMs,
           bytes: streamedTts.totalBytes
         });
+        elevenlabsTtsFirstByteMs = streamedTts.firstByteMs;
 
         audioStreamCompletedAt = Date.now();
         send(runtime.connection, {
@@ -298,20 +312,20 @@ export function queueAssistantResponse(
           totalBytes: streamedTts.totalBytes
         });
 
-        const sttFinalizeMs = context?.latencyContext
+        sttFinalizeMs = context?.latencyContext
           ? Math.max(
               0,
               context.latencyContext.transcriptFinalizedAt - context.latencyContext.voiceInputEndedAt
             )
           : undefined;
-        const voiceToAudioFirstByteMs = context?.latencyContext
+        voiceToAudioFirstByteMs = context?.latencyContext
           ? Math.max(
               0,
               (audioFirstChunkSentAt ?? audioStreamCompletedAt ?? Date.now()) -
                 context.latencyContext.voiceInputEndedAt
             )
           : undefined;
-        const voiceToAudioDeliveredMs = context?.latencyContext
+        voiceToAudioDeliveredMs = context?.latencyContext
           ? Math.max(
               0,
               (audioStreamCompletedAt ?? audioFirstChunkSentAt ?? Date.now()) -
@@ -324,7 +338,8 @@ export function queueAssistantResponse(
           sessionId: runtime.sessionId,
           traceId: trace.traceId,
           totalMs: Date.now() - trace.startedAt,
-          firstByteMs: completion.firstByteMs,
+          firstByteMs: completionFirstByteMs,
+          elevenlabsTtsFirstByteMs,
           sttFinalizeMs,
           voiceToAudioFirstByteMs,
           voiceToAudioDeliveredMs,
@@ -354,6 +369,27 @@ export function queueAssistantResponse(
         });
 
         send(runtime.connection, {
+          type: "pipeline.metrics",
+          sessionId: runtime.sessionId,
+          traceId: trace.traceId,
+          totalMs: Date.now() - trace.startedAt,
+          firstByteMs: completionFirstByteMs,
+          elevenlabsTtsFirstByteMs,
+          sttFinalizeMs,
+          voiceToAudioFirstByteMs,
+          voiceToAudioDeliveredMs,
+          stages: trace.getStageSummaries()
+        });
+
+        trace.flush({
+          status: "error",
+          message,
+          sttFinalizeMs,
+          voiceToAudioFirstByteMs,
+          voiceToAudioDeliveredMs
+        });
+
+        send(runtime.connection, {
           type: "server.error",
           message
         });
@@ -379,22 +415,22 @@ function buildSystemPrompt(
     ordinal: number;
     text: string;
   }>,
-  responseLanguage?: string
+  responseLanguage?: string,
+  ragPrompt?: string
 ): string {
   const context = matches.length
     ? matches.map((match) => `[chunk-${match.ordinal + 1}]\n${match.text}`).join("\n\n")
     : "Контекст не найден.";
   const normalizedLanguage = normalizeLanguageTag(responseLanguage);
+  const promptBlock = ragPrompt?.trim() || DEFAULT_RAG_PROMPT;
   const languageInstruction = normalizedLanguage
     ? `Критично: итоговый ответ дай на ${getLanguageDisplayName(normalizedLanguage)} языке (код: ${normalizedLanguage}). Если пользователь смешивает языки, используй этот язык как основной для всего ответа.`
     : "Отвечай кратко и на языке пользователя.";
 
   return [
-    "Ты отвечаешь как голосовой RAG-ассистент.",
     languageInstruction,
-    "Используй контекст ниже, если он релевантен.",
-    "Если контекста не хватает, скажи об этом прямо.",
-    "Если ссылаешься на источник, используй формат [chunk-N].",
+    "Критично: строго следуй дополнительным инструкциям ниже. Они определяют стиль и формат ответа для текущей RAG-сессии.",
+    promptBlock,
     "",
     "Контекст:",
     context

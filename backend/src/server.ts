@@ -12,6 +12,7 @@ import { getLanguageDisplayName, inferLanguageFromText, normalizeLanguageTag } f
 import { log } from "./logging.js";
 import type { ClientEvent, ServerEvent } from "./protocol.js";
 import {
+  DEFAULT_RAG_PROMPT,
   indexMarkdownKnowledge,
   queueAssistantResponse,
   startSpeechRecognition,
@@ -168,6 +169,7 @@ wsServer.on("connection", (connection) => {
     connection,
     sampleRate: 16000,
     knowledgeMarkdown: "",
+    ragPrompt: DEFAULT_RAG_PROMPT,
     finalSegments: [],
     processing: Promise.resolve(),
     deepgramReady: false,
@@ -385,6 +387,18 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
             message: error instanceof Error ? error.message : "Knowledge indexing failed"
           });
         });
+      return;
+    }
+
+    case "prompt.set": {
+      runtime.ragPrompt = event.prompt.trim() || DEFAULT_RAG_PROMPT;
+
+      send(connection, {
+        type: "server.status",
+        sessionId: session.id,
+        phase: session.phase,
+        detail: "RAG prompt updated. The new instructions will be used for the next turn."
+      });
       return;
     }
 
