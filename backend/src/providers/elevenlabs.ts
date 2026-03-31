@@ -84,27 +84,32 @@ async function streamWithProfile(
   const startedAt = Date.now();
   const requestBody: Record<string, string> = {
     text: options.text,
-    model_id: profile.modelId,
-    output_format: "mp3_44100_128"
+    model_id: profile.modelId
   };
+
+  const requestUrl = new URL(
+    `${baseUrl}/v1/text-to-speech/${encodeURIComponent(profile.voiceId)}/stream`
+  );
+  requestUrl.searchParams.set("output_format", env.ELEVENLABS_OUTPUT_FORMAT);
+  requestUrl.searchParams.set(
+    "optimize_streaming_latency",
+    String(env.ELEVENLABS_OPTIMIZE_STREAMING_LATENCY)
+  );
 
   if (profile.languageCode) {
     requestBody.language_code = profile.languageCode;
   }
 
-  const response = await fetch(
-    `${baseUrl}/v1/text-to-speech/${encodeURIComponent(profile.voiceId)}/stream`,
-    {
-      method: "POST",
-      headers: {
-        "xi-api-key": apiKey,
-        "Content-Type": "application/json",
-        Accept: "audio/mpeg"
-      },
-      body: JSON.stringify(requestBody),
-      signal: withTimeoutSignal(30000, options.signal)
-    }
-  );
+  const response = await fetch(requestUrl, {
+    method: "POST",
+    headers: {
+      "xi-api-key": apiKey,
+      "Content-Type": "application/json",
+      Accept: "audio/mpeg"
+    },
+    body: JSON.stringify(requestBody),
+    signal: withTimeoutSignal(30000, options.signal)
+  });
 
   if (!response.ok || !response.body) {
     const errorText = await response.text();

@@ -24,10 +24,10 @@ export async function streamGroqCompletion(
       Authorization: `Bearer ${env.GROQ_API}`
     },
     body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
+      model: env.GROQ_MODEL,
       stream: true,
       temperature: 0.1,
-      max_tokens: 220,
+      max_tokens: env.GROQ_MAX_TOKENS,
       messages: [
         {
           role: "system",

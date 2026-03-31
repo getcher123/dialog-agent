@@ -1,5 +1,6 @@
 import type WebSocket from "ws";
 
+import { env } from "../config/env.js";
 import {
   getLanguageDisplayName,
   inferLanguageFromText,
@@ -228,7 +229,6 @@ export function queueSessionGreeting(runtime: RuntimeSessionState, send: SendFn)
 
       let audioResponseStarted = false;
       let totalBytes = 0;
-      let sequence = 0;
       let interrupted = false;
       const greetingText = SESSION_GREETING_SEGMENTS.map((segment) => segment.text).join(" ");
 
@@ -276,15 +276,8 @@ export function queueSessionGreeting(runtime: RuntimeSessionState, send: SendFn)
                 });
               }
 
-              sequence += 1;
               totalBytes += chunk.byteLength;
-              send(runtime.connection, {
-                type: "audio.response.chunk",
-                sessionId: runtime.sessionId,
-                base64: chunk.toString("base64"),
-                bytes: chunk.byteLength,
-                sequence
-              });
+              sendBinary(runtime.connection, chunk);
             }
           });
 
@@ -297,7 +290,9 @@ export function queueSessionGreeting(runtime: RuntimeSessionState, send: SendFn)
               endpointHost: streamed.endpointHost,
               servedRegion: streamed.servedRegion,
               voiceId: streamed.voiceId,
-              modelId: streamed.modelId
+              modelId: streamed.modelId,
+              outputFormat: env.ELEVENLABS_OUTPUT_FORMAT,
+              optimizeStreamingLatency: env.ELEVENLABS_OPTIMIZE_STREAMING_LATENCY
             }
           );
         }
@@ -409,7 +404,6 @@ export function queueAssistantResponse(
       let ttsStageStartedAt: number | undefined;
       let ttsStageCompletedAt: number | undefined;
       let ttsTotalBytes = 0;
-      let ttsChunkSequence = 0;
       let pendingTtsBuffer = "";
       let ttsProfileMetadata:
         | {
@@ -418,9 +412,12 @@ export function queueAssistantResponse(
             voiceId: string;
             modelId: string;
             fallbackUsed: boolean;
+            outputFormat: string;
+            optimizeStreamingLatency: number;
           }
         | undefined;
       let ttsQueue: Promise<void> = Promise.resolve();
+      let ttsQueueFailure: unknown;
       let interrupted = false;
 
       const isTurnActive = (): boolean =>
@@ -445,58 +442,56 @@ export function queueAssistantResponse(
           return;
         }
 
-        ttsQueue = ttsQueue.then(async () => {
-          if (!isTurnActive()) {
-            return;
-          }
-
-          if (ttsStageStartedAt === undefined) {
-            ttsStageStartedAt = Date.now();
-            ensureAudioResponseStarted();
-          }
-
-          const streamedTts = await streamElevenLabsTts({
-            text: normalizedSegment,
-            language: requestedLanguage,
-            signal: abortController.signal,
-            onChunk: (chunk) => {
-              if (!isTurnActive()) {
-                return;
-              }
-
-              const chunkSentAt = Date.now();
-
-              if (audioFirstChunkSentAt === undefined) {
-                audioFirstChunkSentAt = chunkSentAt;
-              }
-
-              ttsChunkSequence += 1;
-              ttsTotalBytes += chunk.byteLength;
-
-              send(runtime.connection, {
-                type: "audio.response.chunk",
-                sessionId: runtime.sessionId,
-                base64: chunk.toString("base64"),
-                bytes: chunk.byteLength,
-                sequence: ttsChunkSequence
-              });
+        ttsQueue = ttsQueue
+          .then(async () => {
+            if (!isTurnActive()) {
+              return;
             }
+
+            if (ttsStageStartedAt === undefined) {
+              ttsStageStartedAt = Date.now();
+              ensureAudioResponseStarted();
+            }
+
+            const streamedTts = await streamElevenLabsTts({
+              text: normalizedSegment,
+              language: requestedLanguage,
+              signal: abortController.signal,
+              onChunk: (chunk) => {
+                if (!isTurnActive()) {
+                  return;
+                }
+
+                const chunkSentAt = Date.now();
+
+                if (audioFirstChunkSentAt === undefined) {
+                  audioFirstChunkSentAt = chunkSentAt;
+                }
+
+                ttsTotalBytes += chunk.byteLength;
+                sendBinary(runtime.connection, chunk);
+              }
+            });
+
+            if (!ttsProfileMetadata) {
+              ttsProfileMetadata = {
+                endpointHost: streamedTts.endpointHost,
+                servedRegion: streamedTts.servedRegion,
+                voiceId: streamedTts.voiceId,
+                modelId: streamedTts.modelId,
+                fallbackUsed: streamedTts.fallbackUsed,
+                outputFormat: env.ELEVENLABS_OUTPUT_FORMAT,
+                optimizeStreamingLatency: env.ELEVENLABS_OPTIMIZE_STREAMING_LATENCY
+              };
+            } else if (streamedTts.fallbackUsed) {
+              ttsProfileMetadata.fallbackUsed = true;
+            }
+
+            ttsStageCompletedAt = Date.now();
+          })
+          .catch((error) => {
+            ttsQueueFailure ??= error;
           });
-
-          if (!ttsProfileMetadata) {
-            ttsProfileMetadata = {
-              endpointHost: streamedTts.endpointHost,
-              servedRegion: streamedTts.servedRegion,
-              voiceId: streamedTts.voiceId,
-              modelId: streamedTts.modelId,
-              fallbackUsed: streamedTts.fallbackUsed
-            };
-          } else if (streamedTts.fallbackUsed) {
-            ttsProfileMetadata.fallbackUsed = true;
-          }
-
-          ttsStageCompletedAt = Date.now();
-        });
       };
 
       try {
@@ -580,6 +575,9 @@ export function queueAssistantResponse(
         }
 
         await ttsQueue;
+        if (ttsQueueFailure) {
+          throw ttsQueueFailure;
+        }
 
         if (!isTurnActive()) {
           interrupted = true;
@@ -599,7 +597,9 @@ export function queueAssistantResponse(
             servedRegion: ttsProfileMetadata?.servedRegion,
             voiceId: ttsProfileMetadata?.voiceId,
             modelId: ttsProfileMetadata?.modelId,
-            fallbackUsed: ttsProfileMetadata?.fallbackUsed ?? false
+            fallbackUsed: ttsProfileMetadata?.fallbackUsed ?? false,
+            outputFormat: ttsProfileMetadata?.outputFormat,
+            optimizeStreamingLatency: ttsProfileMetadata?.optimizeStreamingLatency
           });
         }
 
@@ -942,4 +942,14 @@ function isAbortError(error: unknown): boolean {
   }
 
   return false;
+}
+
+function sendBinary(connection: WebSocket, chunk: Buffer): void {
+  if (connection.readyState !== 1) {
+    return;
+  }
+
+  connection.send(chunk, {
+    binary: true
+  });
 }

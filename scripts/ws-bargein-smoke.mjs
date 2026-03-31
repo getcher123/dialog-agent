@@ -36,7 +36,14 @@ function finish() {
   ws.close();
 }
 
-ws.on("message", (raw) => {
+ws.on("message", (raw, isBinary) => {
+  if (isBinary) {
+    stamp("audio.chunk", {
+      bytes: raw.byteLength
+    });
+    return;
+  }
+
   const event = JSON.parse(raw.toString());
 
   if (event.type === "connection.ready" && !sent) {
@@ -62,14 +69,6 @@ ws.on("message", (raw) => {
       })
     );
     stamp("turn.interrupt.sent");
-    return;
-  }
-
-  if (event.type === "audio.response.chunk") {
-    stamp("audio.chunk", {
-      sequence: event.sequence,
-      bytes: event.bytes
-    });
     return;
   }
 

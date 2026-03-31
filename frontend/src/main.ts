@@ -117,12 +117,17 @@ interface AudioStreamPlayback {
   totalBytes: number;
 }
 
+const TARGET_SAMPLE_RATE = 16000;
+const FALLBACK_CAPTURE_BUFFER_SIZE = 1024;
+const PCM_CAPTURE_WORKLET = "pcm16-capture-worklet";
+const PCM_CAPTURE_WORKLET_URL = new URL("./pcm16-capture-worklet.js", import.meta.url);
+
 let socket: WebSocket | null = null;
 let sessionId = "n/a";
 let mediaStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
 let analyser: AnalyserNode | null = null;
-let scriptProcessor: ScriptProcessorNode | null = null;
+let captureNode: AudioWorkletNode | ScriptProcessorNode | null = null;
 let microphoneSource: MediaStreamAudioSourceNode | null = null;
 let silentGain: GainNode | null = null;
 let waveformFrame = 0;
@@ -186,7 +191,12 @@ async function startSession(): Promise<void> {
 
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: true
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
     });
     micStatus.textContent = "live";
     triggerStatus.textContent = "waiting for speech";
@@ -195,14 +205,14 @@ async function startSession(): Promise<void> {
     startButton.disabled = true;
     stopButton.disabled = false;
 
-    setupWaveform(mediaStream);
+    await setupWaveform(mediaStream);
     await ensureSocketConnected();
     syncRagPromptToServer();
     if (hadOpenSocket) {
       socket?.send(
         JSON.stringify({
           type: "session.start",
-          sampleRate: Math.round(audioContext?.sampleRate ?? 16000)
+          sampleRate: TARGET_SAMPLE_RATE
         })
       );
     }
@@ -243,7 +253,7 @@ function stopSession(): void {
   }
 
   analyser = null;
-  scriptProcessor = null;
+  captureNode = null;
   microphoneSource = null;
   silentGain = null;
   cancelAnimationFrame(waveformFrame);
@@ -321,6 +331,7 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
     : `${protocol}://${host}/ws`;
 
   socket = new WebSocket(url);
+  socket.binaryType = "arraybuffer";
   wsStatus.textContent = "connecting";
   triggerStatus.textContent = "arming";
   setConnectionState("connecting");
@@ -335,7 +346,7 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
     socket?.send(
       JSON.stringify({
         type: "session.start",
-        sampleRate: Math.round(audioContext?.sampleRate ?? 16000)
+        sampleRate: TARGET_SAMPLE_RATE
       })
     );
 
@@ -355,8 +366,7 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
   });
 
   socket.addEventListener("message", (event) => {
-    const payload = JSON.parse(event.data) as ServerEvent;
-    handleServerEvent(payload);
+    void handleSocketMessage(event);
   });
 
   socket.addEventListener("close", () => {
@@ -393,6 +403,23 @@ async function ensureSocketConnected(): Promise<void> {
     if (socket?.readyState !== WebSocket.CONNECTING) {
       socketConnectPromise = null;
     }
+  }
+}
+
+async function handleSocketMessage(event: MessageEvent<string | ArrayBuffer | Blob>): Promise<void> {
+  if (typeof event.data === "string") {
+    const payload = JSON.parse(event.data) as ServerEvent;
+    handleServerEvent(payload);
+    return;
+  }
+
+  if (event.data instanceof ArrayBuffer) {
+    appendStreamingAudioChunkBuffer(event.data);
+    return;
+  }
+
+  if (event.data instanceof Blob) {
+    appendStreamingAudioChunkBuffer(await event.data.arrayBuffer());
   }
 }
 
@@ -825,6 +852,23 @@ function appendStreamingAudioChunk(base64: string, bytes: number): void {
   activeAudioStream.fallbackChunks.push(chunk);
 }
 
+function appendStreamingAudioChunkBuffer(chunk: ArrayBuffer): void {
+  if (!activeAudioStream) {
+    return;
+  }
+
+  const normalized = chunk.slice(0);
+  activeAudioStream.totalBytes += normalized.byteLength;
+
+  if (activeAudioStream.mediaSource) {
+    activeAudioStream.chunkQueue.push(normalized);
+    flushStreamingAudioQueue(activeAudioStream);
+    return;
+  }
+
+  activeAudioStream.fallbackChunks.push(normalized);
+}
+
 function finishStreamingAudioResponse(): void {
   if (!activeAudioStream) {
     return;
@@ -969,40 +1013,127 @@ function setConnectionState(state: "idle" | "connecting" | "live"): void {
   connectionPill.className = `pill ${state === "live" ? "pill-live" : "pill-idle"}`;
 }
 
-function setupWaveform(stream: MediaStream): void {
-  audioContext = new AudioContext();
+async function setupWaveform(stream: MediaStream): Promise<void> {
+  audioContext = new AudioContext({
+    latencyHint: "interactive"
+  });
   microphoneSource = audioContext.createMediaStreamSource(stream);
   analyser = audioContext.createAnalyser();
-  scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
   silentGain = audioContext.createGain();
 
-  analyser.fftSize = 2048;
+  analyser.fftSize = 1024;
   silentGain.gain.value = 0;
 
   microphoneSource.connect(analyser);
-  microphoneSource.connect(scriptProcessor);
-  scriptProcessor.connect(silentGain);
   silentGain.connect(audioContext.destination);
 
-  scriptProcessor.onaudioprocess = (event) => {
+  const workletReady = await setupAudioWorkletCapture();
+  if (!workletReady) {
+    setupScriptProcessorCapture();
+  }
+
+  cancelAnimationFrame(waveformFrame);
+  drawWaveform();
+}
+
+async function setupAudioWorkletCapture(): Promise<boolean> {
+  if (!audioContext || !microphoneSource || !silentGain) {
+    return false;
+  }
+
+  if (typeof AudioWorkletNode === "undefined" || !audioContext.audioWorklet) {
+    addEventRow("Audio", "AudioWorklet is unavailable. Falling back to ScriptProcessor capture.");
+    return false;
+  }
+
+  try {
+    await audioContext.audioWorklet.addModule(PCM_CAPTURE_WORKLET_URL.href);
+    const workletNode = new AudioWorkletNode(audioContext, PCM_CAPTURE_WORKLET, {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      channelCount: 1,
+      channelCountMode: "explicit"
+    });
+
+    workletNode.port.onmessage = (messageEvent: MessageEvent<ArrayBuffer>) => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      socket.send(messageEvent.data);
+    };
+
+    microphoneSource.connect(workletNode);
+    workletNode.connect(silentGain);
+    captureNode = workletNode;
+    addEventRow("Audio", "AudioWorklet capture enabled. Sending 16kHz PCM frames.");
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "AudioWorklet init failed";
+    addEventRow("Audio", `AudioWorklet failed: ${message}. Falling back to ScriptProcessor.`);
+    return false;
+  }
+}
+
+function setupScriptProcessorCapture(): void {
+  if (!audioContext || !microphoneSource || !silentGain) {
+    return;
+  }
+
+  const processor = audioContext.createScriptProcessor(FALLBACK_CAPTURE_BUFFER_SIZE, 1, 1);
+  processor.onaudioprocess = (event) => {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return;
     }
 
     const input = event.inputBuffer.getChannelData(0);
-    const buffer = new ArrayBuffer(input.length * 2);
-    const view = new DataView(buffer);
-
-    for (let index = 0; index < input.length; index += 1) {
-      const sample = Math.max(-1, Math.min(1, input[index]));
-      view.setInt16(index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    const buffer = encodePcm16(input, audioContext?.sampleRate ?? TARGET_SAMPLE_RATE, TARGET_SAMPLE_RATE);
+    if (buffer.byteLength > 0) {
+      socket.send(buffer);
     }
-
-    socket.send(buffer);
   };
 
-  cancelAnimationFrame(waveformFrame);
-  drawWaveform();
+  microphoneSource.connect(processor);
+  processor.connect(silentGain);
+  captureNode = processor;
+}
+
+function encodePcm16(
+  input: Float32Array,
+  inputSampleRate: number,
+  outputSampleRate: number
+): ArrayBuffer {
+  if (input.length === 0) {
+    return new ArrayBuffer(0);
+  }
+
+  if (inputSampleRate === outputSampleRate) {
+    const pcm = new Int16Array(input.length);
+    for (let index = 0; index < input.length; index += 1) {
+      const sample = Math.max(-1, Math.min(1, input[index]));
+      pcm[index] = Math.round(sample < 0 ? sample * 0x8000 : sample * 0x7fff);
+    }
+    return pcm.buffer;
+  }
+
+  const ratio = inputSampleRate / outputSampleRate;
+  const outputLength = Math.max(1, Math.floor(input.length / ratio));
+  const pcm = new Int16Array(outputLength);
+  let position = 0;
+
+  for (let index = 0; index < outputLength; index += 1) {
+    const baseIndex = Math.floor(position);
+    const nextIndex = Math.min(baseIndex + 1, input.length - 1);
+    const mix = position - baseIndex;
+    const left = input[baseIndex] ?? 0;
+    const right = input[nextIndex] ?? left;
+    const sample = Math.max(-1, Math.min(1, left + (right - left) * mix));
+    pcm[index] = Math.round(sample < 0 ? sample * 0x8000 : sample * 0x7fff);
+    position += ratio;
+  }
+
+  return pcm.buffer;
 }
 
 function drawWaveform(): void {

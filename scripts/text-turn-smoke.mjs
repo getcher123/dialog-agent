@@ -51,7 +51,13 @@ const answer = await streamGroqCompletion({
   userPrompt: question,
   onDelta: () => {}
 });
-const tts = await streamElevenLabsTts(answer.text);
+let ttsBytes = 0;
+const tts = await streamElevenLabsTts({
+  text: answer.text,
+  onChunk: (chunk) => {
+    ttsBytes += chunk.byteLength;
+  }
+});
 
 const lines = [
   "# Text Turn Smoke",
@@ -66,7 +72,7 @@ const lines = [
   `| Chunk count | ${chunks.length} |`,
   `| Retrieved chunks | ${matches.map((match) => `chunk-${match.ordinal + 1}`).join(", ") || "none"} |`,
   `| Answer | ${escapeCell(answer.text)} |`,
-  `| TTS bytes | ${tts.audioBuffer.byteLength} |`,
+  `| TTS bytes | ${ttsBytes} |`,
   `| TTS first byte ms | ${tts.firstByteMs} |`,
   `| TTS total ms | ${tts.totalMs} |`,
   "",
@@ -92,7 +98,7 @@ console.log(
         ordinal: match.ordinal,
         score: Number(match.score.toFixed(3))
       })),
-      ttsBytes: tts.audioBuffer.byteLength,
+      ttsBytes,
       ttsFirstByteMs: tts.firstByteMs,
       ttsTotalMs: tts.totalMs
     },

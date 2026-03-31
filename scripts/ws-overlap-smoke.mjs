@@ -52,7 +52,17 @@ ws.on("open", () => {
   stamp("ws.open");
 });
 
-ws.on("message", (raw) => {
+ws.on("message", (raw, isBinary) => {
+  if (isBinary) {
+    if (firstAudioAt === undefined) {
+      firstAudioAt = Date.now() - startedAt;
+      stamp("audio.first_chunk", {
+        bytes: raw.byteLength
+      });
+    }
+    return;
+  }
+
   const event = JSON.parse(raw.toString());
   if (!sessionId && event.sessionId) {
     sessionId = event.sessionId;
@@ -86,15 +96,6 @@ ws.on("message", (raw) => {
 
   if (event.type === "audio.response.start") {
     stamp("audio.start");
-    return;
-  }
-
-  if (event.type === "audio.response.chunk" && firstAudioAt === undefined) {
-    firstAudioAt = Date.now() - startedAt;
-    stamp("audio.first_chunk", {
-      bytes: event.bytes,
-      sequence: event.sequence
-    });
     return;
   }
 
