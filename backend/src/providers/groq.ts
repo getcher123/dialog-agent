@@ -8,13 +8,15 @@ interface GroqStreamOptions {
 
 export async function streamGroqCompletion(
   options: GroqStreamOptions
-): Promise<{ text: string; firstByteMs?: number }> {
+): Promise<{ text: string; firstByteMs?: number; endpointHost: string }> {
   if (!env.GROQ_API) {
     throw new Error("GROQ_API is not configured");
   }
 
+  const baseUrl = env.GROQ_BASE_URL.replace(/\/$/, "");
+  const endpointHost = new URL(baseUrl).host;
   const startedAt = Date.now();
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -90,6 +92,7 @@ export async function streamGroqCompletion(
 
   return {
     text: fullText.trim(),
-    firstByteMs
+    firstByteMs,
+    endpointHost
   };
 }

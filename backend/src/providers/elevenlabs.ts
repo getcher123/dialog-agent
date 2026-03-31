@@ -11,6 +11,8 @@ export interface TtsStreamResult {
   firstByteMs: number;
   totalMs: number;
   totalBytes: number;
+  endpointHost: string;
+  servedRegion?: string;
   language?: string;
   voiceId: string;
   modelId: string;
@@ -71,6 +73,8 @@ async function streamWithProfile(
   options: StreamElevenLabsTtsOptions,
   apiKey: string
 ): Promise<TtsStreamResult> {
+  const baseUrl = env.ELEVENLABS_BASE_URL.replace(/\/$/, "");
+  const endpointHost = new URL(baseUrl).host;
   const startedAt = Date.now();
   const requestBody: Record<string, string> = {
     text: options.text,
@@ -83,7 +87,7 @@ async function streamWithProfile(
   }
 
   const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(profile.voiceId)}/stream`,
+    `${baseUrl}/v1/text-to-speech/${encodeURIComponent(profile.voiceId)}/stream`,
     {
       method: "POST",
       headers: {
@@ -101,6 +105,7 @@ async function streamWithProfile(
     throw new Error(`ElevenLabs TTS failed: ${response.status} ${errorText.slice(0, 500)}`);
   }
 
+  const servedRegion = response.headers.get("x-region")?.trim() || undefined;
   const reader = response.body.getReader();
   let firstByteMs = 0;
   let totalBytes = 0;
@@ -131,6 +136,8 @@ async function streamWithProfile(
     firstByteMs,
     totalMs: Date.now() - startedAt,
     totalBytes,
+    endpointHost,
+    servedRegion,
     language: profile.language,
     voiceId: profile.voiceId,
     modelId: profile.modelId,

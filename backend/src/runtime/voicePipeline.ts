@@ -223,6 +223,88 @@ export function queueAssistantResponse(
       let sttFinalizeMs: number | undefined;
       let voiceToAudioFirstByteMs: number | undefined;
       let voiceToAudioDeliveredMs: number | undefined;
+      let audioResponseStarted = false;
+      let audioFirstChunkSentAt: number | undefined;
+      let audioStreamCompletedAt: number | undefined;
+      let ttsStageStartedAt: number | undefined;
+      let ttsStageCompletedAt: number | undefined;
+      let ttsTotalBytes = 0;
+      let ttsChunkSequence = 0;
+      let pendingTtsBuffer = "";
+      let ttsProfileMetadata:
+        | {
+            endpointHost: string;
+            servedRegion?: string;
+            voiceId: string;
+            modelId: string;
+            fallbackUsed: boolean;
+          }
+        | undefined;
+      let ttsQueue: Promise<void> = Promise.resolve();
+
+      const ensureAudioResponseStarted = (): void => {
+        if (audioResponseStarted) {
+          return;
+        }
+
+        audioResponseStarted = true;
+        send(runtime.connection, {
+          type: "audio.response.start",
+          sessionId: runtime.sessionId,
+          mimeType: "audio/mpeg"
+        });
+      };
+
+      const queueTtsSegment = (segmentText: string): void => {
+        const normalizedSegment = normalizeTtsSegment(segmentText);
+        if (!normalizedSegment) {
+          return;
+        }
+
+        ttsQueue = ttsQueue.then(async () => {
+          if (ttsStageStartedAt === undefined) {
+            ttsStageStartedAt = Date.now();
+            ensureAudioResponseStarted();
+          }
+
+          const streamedTts = await streamElevenLabsTts({
+            text: normalizedSegment,
+            language: requestedLanguage,
+            onChunk: (chunk) => {
+              const chunkSentAt = Date.now();
+
+              if (audioFirstChunkSentAt === undefined) {
+                audioFirstChunkSentAt = chunkSentAt;
+              }
+
+              ttsChunkSequence += 1;
+              ttsTotalBytes += chunk.byteLength;
+
+              send(runtime.connection, {
+                type: "audio.response.chunk",
+                sessionId: runtime.sessionId,
+                base64: chunk.toString("base64"),
+                bytes: chunk.byteLength,
+                sequence: ttsChunkSequence
+              });
+            }
+          });
+
+          if (!ttsProfileMetadata) {
+            ttsProfileMetadata = {
+              endpointHost: streamedTts.endpointHost,
+              servedRegion: streamedTts.servedRegion,
+              voiceId: streamedTts.voiceId,
+              modelId: streamedTts.modelId,
+              fallbackUsed: streamedTts.fallbackUsed
+            };
+          } else if (streamedTts.fallbackUsed) {
+            ttsProfileMetadata.fallbackUsed = true;
+          }
+
+          ttsStageCompletedAt = Date.now();
+        });
+      };
 
       try {
         const embeddingStartedAt = Date.now();
@@ -242,6 +324,15 @@ export function queueAssistantResponse(
           systemPrompt: buildSystemPrompt(matches, requestedLanguage, runtime.ragPrompt),
           userPrompt: transcript,
           onDelta: (delta) => {
+            pendingTtsBuffer += delta;
+
+            const extracted = extractReadyTtsSegments(pendingTtsBuffer);
+            pendingTtsBuffer = extracted.remaining;
+
+            for (const segment of extracted.segments) {
+              queueTtsSegment(segment);
+            }
+
             send(runtime.connection, {
               type: "transcript.partial",
               sessionId: runtime.sessionId,
@@ -252,7 +343,8 @@ export function queueAssistantResponse(
         });
         trace.completeStage("groq_completion", generationStartedAt, Date.now(), {
           firstByteMs: completion.firstByteMs,
-          characters: completion.text.length
+          characters: completion.text.length,
+          endpointHost: completion.endpointHost
         });
         completionFirstByteMs = completion.firstByteMs;
 
@@ -263,10 +355,6 @@ export function queueAssistantResponse(
           text: completion.text
         });
 
-        const ttsStartedAt = Date.now();
-        let audioFirstChunkSentAt: number | undefined;
-        let audioStreamCompletedAt: number | undefined;
-
         send(runtime.connection, {
           type: "server.status",
           sessionId: runtime.sessionId,
@@ -274,43 +362,40 @@ export function queueAssistantResponse(
           detail: `Generating ${languageLabel} speech output. Language source: ${languageSource}.`
         });
 
-        send(runtime.connection, {
-          type: "audio.response.start",
-          sessionId: runtime.sessionId,
-          mimeType: "audio/mpeg"
-        });
+        const finalSegments = extractReadyTtsSegments(pendingTtsBuffer, true);
+        pendingTtsBuffer = finalSegments.remaining;
 
-        const streamedTts = await streamElevenLabsTts({
-          text: completion.text,
-          language: requestedLanguage,
-          onChunk: (chunk, info) => {
-            const chunkSentAt = Date.now();
+        for (const segment of finalSegments.segments) {
+          queueTtsSegment(segment);
+        }
 
-            if (audioFirstChunkSentAt === undefined) {
-              audioFirstChunkSentAt = chunkSentAt;
-            }
+        await ttsQueue;
 
-            send(runtime.connection, {
-              type: "audio.response.chunk",
-              sessionId: runtime.sessionId,
-              base64: chunk.toString("base64"),
-              bytes: chunk.byteLength,
-              sequence: info.sequence
-            });
-          }
-        });
-        trace.completeStage("elevenlabs_tts", ttsStartedAt, Date.now(), {
-          firstByteMs: streamedTts.firstByteMs,
-          bytes: streamedTts.totalBytes
-        });
-        elevenlabsTtsFirstByteMs = streamedTts.firstByteMs;
+        if (ttsStageStartedAt !== undefined) {
+          elevenlabsTtsFirstByteMs =
+            audioFirstChunkSentAt !== undefined
+              ? Math.max(0, audioFirstChunkSentAt - ttsStageStartedAt)
+              : undefined;
+
+          trace.completeStage("elevenlabs_tts", ttsStageStartedAt, ttsStageCompletedAt ?? Date.now(), {
+            firstByteMs: elevenlabsTtsFirstByteMs,
+            bytes: ttsTotalBytes,
+            endpointHost: ttsProfileMetadata?.endpointHost,
+            servedRegion: ttsProfileMetadata?.servedRegion,
+            voiceId: ttsProfileMetadata?.voiceId,
+            modelId: ttsProfileMetadata?.modelId,
+            fallbackUsed: ttsProfileMetadata?.fallbackUsed ?? false
+          });
+        }
 
         audioStreamCompletedAt = Date.now();
-        send(runtime.connection, {
-          type: "audio.response.end",
-          sessionId: runtime.sessionId,
-          totalBytes: streamedTts.totalBytes
-        });
+        if (audioResponseStarted) {
+          send(runtime.connection, {
+            type: "audio.response.end",
+            sessionId: runtime.sessionId,
+            totalBytes: ttsTotalBytes
+          });
+        }
 
         sttFinalizeMs = context?.latencyContext
           ? Math.max(
@@ -367,6 +452,14 @@ export function queueAssistantResponse(
           route: trace.route,
           message
         });
+
+        if (audioResponseStarted) {
+          send(runtime.connection, {
+            type: "audio.response.end",
+            sessionId: runtime.sessionId,
+            totalBytes: ttsTotalBytes
+          });
+        }
 
         send(runtime.connection, {
           type: "pipeline.metrics",
@@ -448,4 +541,126 @@ function resolveResponseLanguage(
     inferLanguageFromText(transcript) ??
     "ru"
   );
+}
+
+function extractReadyTtsSegments(
+  buffer: string,
+  flushAll = false
+): {
+  segments: string[];
+  remaining: string;
+} {
+  const segments: string[] = [];
+  let working = buffer;
+
+  while (true) {
+    const boundary = findTtsSegmentBoundary(working, flushAll);
+
+    if (boundary === -1) {
+      return {
+        segments,
+        remaining: working
+      };
+    }
+
+    const segment = normalizeTtsSegment(working.slice(0, boundary));
+    working = working.slice(boundary).trimStart();
+
+    if (segment) {
+      segments.push(segment);
+    }
+
+    if (flushAll && !working.trim()) {
+      return {
+        segments,
+        remaining: ""
+      };
+    }
+  }
+}
+
+function findTtsSegmentBoundary(text: string, flushAll: boolean): number {
+  const trimmedEnd = text.trimEnd().length;
+
+  if (trimmedEnd === 0) {
+    return -1;
+  }
+
+  if (flushAll) {
+    return trimmedEnd;
+  }
+
+  let lastHardBoundary = -1;
+  let lastSoftPunctuationBoundary = -1;
+  let lastWhitespaceBoundary = -1;
+
+  for (let index = 0; index < trimmedEnd; index += 1) {
+    const char = text[index];
+
+    if (char === "\n") {
+      lastHardBoundary = index + 1;
+      continue;
+    }
+
+    if (/[.!?…。！？]/.test(char)) {
+      let cursor = index + 1;
+      while (cursor < trimmedEnd && /[\s"'»)\]]/.test(text[cursor] ?? "")) {
+        cursor += 1;
+      }
+      lastHardBoundary = cursor;
+      continue;
+    }
+
+    if (/[,:;，、—-]/.test(char)) {
+      lastSoftPunctuationBoundary = index + 1;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      lastWhitespaceBoundary = index;
+    }
+  }
+
+  if (lastHardBoundary !== -1) {
+    return lastHardBoundary;
+  }
+
+  if (trimmedEnd >= 110 && lastSoftPunctuationBoundary >= 80) {
+    return lastSoftPunctuationBoundary;
+  }
+
+  if (trimmedEnd >= 130 && lastWhitespaceBoundary >= 95) {
+    return lastWhitespaceBoundary;
+  }
+
+  if (trimmedEnd < 140) {
+    return -1;
+  }
+
+  const softBoundary = findLastSoftBoundary(text, Math.min(trimmedEnd, 170));
+  if (softBoundary !== -1) {
+    return softBoundary;
+  }
+
+  return Math.min(trimmedEnd, 140);
+}
+
+function findLastSoftBoundary(text: string, upTo: number): number {
+  const minimum = Math.min(95, upTo);
+
+  for (let index = upTo - 1; index >= minimum; index -= 1) {
+    const char = text[index];
+
+    if (!/[,:;\s]/.test(char)) {
+      continue;
+    }
+
+    return char.trim() ? index + 1 : index;
+  }
+
+  return -1;
+}
+
+function normalizeTtsSegment(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
