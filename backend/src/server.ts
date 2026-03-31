@@ -14,6 +14,8 @@ import type { ClientEvent, ServerEvent } from "./protocol.js";
 import {
   DEFAULT_RAG_PROMPT,
   indexMarkdownKnowledge,
+  interruptAssistantResponse,
+  queueSessionGreeting,
   queueAssistantResponse,
   startSpeechRecognition,
   type RuntimeSessionState
@@ -175,7 +177,9 @@ wsServer.on("connection", (connection) => {
     deepgramReady: false,
     pendingAudioChunks: [],
     lastAudioChunkAt: undefined,
-    detectedLanguage: undefined
+    detectedLanguage: undefined,
+    activeTurnAbortController: undefined,
+    activeTurnTraceId: undefined
   });
 
   log("ws.connection.opened", { sessionId: session.id });
@@ -309,6 +313,11 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
         phase: started.phase,
         detail: `Session started. Opening provider pipeline for ${event.sampleRate} Hz audio.`
       });
+      return;
+    }
+
+    case "session.greet": {
+      queueSessionGreeting(runtime, send);
       return;
     }
 
@@ -454,6 +463,23 @@ function handleClientEvent(connection: WebSocket, event: ClientEvent): void {
         requestedLanguage,
         languageSource
       });
+      return;
+    }
+
+    case "turn.interrupt": {
+      const interrupted = interruptAssistantResponse(
+        runtime,
+        send,
+        event.reason?.trim() || "Interrupted by user speech."
+      );
+
+      if (!interrupted) {
+        send(connection, {
+          type: "server.warning",
+          sessionId: session.id,
+          message: "Interrupt requested, but no active assistant response is running."
+        });
+      }
       return;
     }
 

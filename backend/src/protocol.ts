@@ -4,6 +4,9 @@ export type ClientEvent =
       sampleRate: number;
     }
   | {
+      type: "session.greet";
+    }
+  | {
       type: "knowledge.set";
       markdown: string;
     }
@@ -14,6 +17,10 @@ export type ClientEvent =
   | {
       type: "text.turn";
       text: string;
+    }
+  | {
+      type: "turn.interrupt";
+      reason?: string;
     }
   | {
       type: "client.ping";

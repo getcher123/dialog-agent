@@ -1,11 +1,15 @@
 import { env } from "../config/env.js";
 
-export async function embedText(input: string): Promise<number[]> {
-  const [embedding] = await embedTexts([input]);
+interface EmbeddingOptions {
+  signal?: AbortSignal;
+}
+
+export async function embedText(input: string, options?: EmbeddingOptions): Promise<number[]> {
+  const [embedding] = await embedTexts([input], options);
   return embedding;
 }
 
-export async function embedTexts(inputs: string[]): Promise<number[][]> {
+export async function embedTexts(inputs: string[], options?: EmbeddingOptions): Promise<number[][]> {
   if (!env.OPENAI_API_KEY) {
     throw new Error("OPENAI_API_KEY is not configured");
   }
@@ -20,7 +24,7 @@ export async function embedTexts(inputs: string[]): Promise<number[][]> {
       model: "text-embedding-3-small",
       input: inputs
     }),
-    signal: AbortSignal.timeout(30000)
+    signal: withTimeoutSignal(30000, options?.signal)
   });
 
   const rawText = await response.text();
@@ -56,6 +60,10 @@ export async function embedTexts(inputs: string[]): Promise<number[][]> {
   }
 
   return vectors;
+}
+
+function withTimeoutSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  return signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs);
 }
 
 function extractResponseMessage(body: unknown): string | null {

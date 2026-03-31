@@ -91,7 +91,8 @@ export async function upsertKnowledge(
 export async function searchKnowledge(
   vector: number[],
   limit = 3,
-  source?: string
+  source?: string,
+  signal?: AbortSignal
 ): Promise<SearchMatch[]> {
   const response = await fetch(`${collectionUrl()}/points/query`, {
     method: "POST",
@@ -117,7 +118,7 @@ export async function searchKnowledge(
           }
         : {})
     }),
-    signal: AbortSignal.timeout(15000)
+    signal: withTimeoutSignal(15000, signal)
   });
 
   if (response.status === 404) {
@@ -218,4 +219,8 @@ export function chunkMarkdown(markdown: string, source = "ui-markdown"): Knowled
 
 function collectionUrl(): string {
   return `${env.QDRANT_URL.replace(/\/$/, "")}/collections/${encodeURIComponent(env.QDRANT_COLLECTION)}`;
+}
+
+function withTimeoutSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  return signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs);
 }

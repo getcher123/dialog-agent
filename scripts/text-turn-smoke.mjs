@@ -40,10 +40,10 @@ const matches = (await searchKnowledge(queryEmbedding, 3)).filter((item) => item
 const context = matches.map((match) => `[chunk-${match.ordinal + 1}]\n${match.text}`).join("\n\n");
 const answer = await streamGroqCompletion({
   systemPrompt: [
-    "Ты отвечаешь как телефонный консультант.",
-    "Используй контекст ниже, если он релевантен.",
-    "Если контекста не хватает, скажи об этом прямо.",
-    "Отвечай кратко, короткими односложными предложениями.",
+    "Answer as if you were a telephone helpline operator.",
+    "Use the context below if it is relevant.",
+    "If there isn’t enough context, say so directly.",
+    "Keep your answer brief. Start your answer with a short sentence.",
     "",
     "Контекст:",
     context || "Контекст не найден."

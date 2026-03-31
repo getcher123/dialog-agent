@@ -23,6 +23,7 @@ interface StreamElevenLabsTtsOptions {
   text: string;
   language?: string;
   onChunk?: (chunk: Buffer, info: TtsChunkInfo) => void;
+  signal?: AbortSignal;
 }
 
 export async function streamElevenLabsTts(
@@ -68,6 +69,11 @@ interface TtsProfile {
   languageCode?: string;
 }
 
+const FAST_TTS_MODEL_BY_LANGUAGE: Record<string, string> = {
+  en: "eleven_flash_v2_5",
+  fr: "eleven_flash_v2_5"
+};
+
 async function streamWithProfile(
   profile: TtsProfile,
   options: StreamElevenLabsTtsOptions,
@@ -96,7 +102,7 @@ async function streamWithProfile(
         Accept: "audio/mpeg"
       },
       body: JSON.stringify(requestBody),
-      signal: AbortSignal.timeout(30000)
+      signal: withTimeoutSignal(30000, options.signal)
     }
   );
 
@@ -145,15 +151,22 @@ async function streamWithProfile(
   };
 }
 
+function withTimeoutSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  return signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs);
+}
+
 function resolveTtsProfile(language?: string): TtsProfile {
   const normalized = normalizeLanguageTag(language);
   const languageSuffix = normalized?.toUpperCase();
   const configuredVoiceId =
     pickNonEmptyEnv(languageSuffix ? `ELEVENLABS_VOICE_ID_${languageSuffix}` : undefined) ??
     env.ELEVENLABS_VOICE_ID;
+  const builtInModelId =
+    (normalized ? FAST_TTS_MODEL_BY_LANGUAGE[normalized] : undefined) ??
+    (normalized && normalized !== "en" ? env.ELEVENLABS_MULTILINGUAL_MODEL_ID : env.ELEVENLABS_MODEL_ID);
   const configuredModelId =
     pickNonEmptyEnv(languageSuffix ? `ELEVENLABS_MODEL_ID_${languageSuffix}` : undefined) ??
-    (normalized && normalized !== "en" ? env.ELEVENLABS_MULTILINGUAL_MODEL_ID : env.ELEVENLABS_MODEL_ID);
+    builtInModelId;
 
   if (!configuredVoiceId) {
     throw new Error("ELEVENLABS_VOICE_ID is not configured");

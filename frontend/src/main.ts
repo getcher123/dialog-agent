@@ -137,6 +137,7 @@ let socketConnectPromise: Promise<void> | null = null;
 let ragPromptSyncTimer: number | null = null;
 let lastSyncedRagPrompt = normalizePrompt(ragPromptInput.value);
 const defaultRagPrompt = lastSyncedRagPrompt;
+let lastInterruptRequestAt = 0;
 
 startButton.addEventListener("click", () => {
   void startSession();
@@ -205,6 +206,11 @@ async function startSession(): Promise<void> {
         })
       );
     }
+    socket?.send(
+      JSON.stringify({
+        type: "session.greet"
+      })
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Microphone permission failed";
     addEventRow("Client", `Microphone error: ${message}`);
@@ -253,6 +259,7 @@ function stopSession(): void {
   triggerStatus.textContent = "not armed";
   processingStatus.textContent = "idle";
   pipelineHint.textContent = "Press Start. Trigger happens automatically after speech pause is detected.";
+  lastInterruptRequestAt = 0;
   startButton.disabled = false;
   stopButton.disabled = true;
   sendTextButton.disabled = false;
@@ -463,6 +470,7 @@ function handleServerEvent(event: ServerEvent): void {
       if (event.role === "assistant") {
         upsertAssistantPartialBubble(event.text);
       } else {
+        maybeInterruptAssistantResponse();
         triggerStatus.textContent = "speech detected";
       }
       return;
@@ -531,6 +539,39 @@ function handleServerEvent(event: ServerEvent): void {
       addEventRow("Error", event.message);
       return;
   }
+}
+
+function maybeInterruptAssistantResponse(): void {
+  const playbackActive = Boolean(activeAudio || activeAudioStream);
+  const pipelineRunning = processingStatus.textContent === "running";
+
+  if (!playbackActive && !pipelineRunning) {
+    return;
+  }
+
+  if (playbackActive) {
+    disposeActiveAudio();
+    addEventRow("Audio", "Playback interrupted by user speech.");
+  }
+
+  const now = Date.now();
+  if (now - lastInterruptRequestAt < 800) {
+    return;
+  }
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  lastInterruptRequestAt = now;
+  processingStatus.textContent = "interrupting";
+  socket.send(
+    JSON.stringify({
+      type: "turn.interrupt",
+      reason: "Interrupted by user speech."
+    })
+  );
+  addEventRow("Client", "Barge-in detected. Interrupt requested.");
 }
 
 function reflectPipelineStatus(phase: string, detail: string): void {

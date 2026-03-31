@@ -33,7 +33,7 @@ export function connectDeepgramStream(
     language: "multi",
     smart_format: "true",
     interim_results: "true",
-    endpointing: "100",
+    endpointing: "300",
     utterance_end_ms: "1000",
     vad_events: "true"
   });

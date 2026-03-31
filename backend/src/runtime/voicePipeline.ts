@@ -33,15 +33,27 @@ export interface RuntimeSessionState {
   pendingAudioChunks: Buffer[];
   lastAudioChunkAt?: number;
   detectedLanguage?: string;
+  activeTurnAbortController?: AbortController;
+  activeTurnTraceId?: string;
 }
 
 type SendFn = (connection: WebSocket, event: ServerEvent) => void;
 const SHARED_KNOWLEDGE_SOURCE = "shared-ui-knowledge";
+const SESSION_GREETING_SEGMENTS = [
+  {
+    language: "en",
+    text: "Hello, thank you for calling. How can I help you today?"
+  },
+  {
+    language: "fr",
+    text: "Bonjour, merci de votre appel. Comment puis-je vous aider aujourd'hui ?"
+  }
+] as const;
 export const DEFAULT_RAG_PROMPT = [
-  "Ты отвечаешь как телефонный консультант.",
-  "Используй контекст ниже, если он релевантен.",
-  "Если контекста не хватает, скажи об этом прямо.",
-  "Отвечай кратко, короткими односложными предложениями."
+  "Answer as if you were a telephone helpline operator.",
+  "Use the context below if it is relevant.",
+  "If there isn’t enough context, say so directly.",
+  "Keep your answer brief. Start your answer with a short sentence."
 ].join("\n");
 
 export interface VoiceLatencyContext {
@@ -206,6 +218,171 @@ export async function indexMarkdownKnowledge(
   };
 }
 
+export function queueSessionGreeting(runtime: RuntimeSessionState, send: SendFn): void {
+  runtime.processing = runtime.processing
+    .then(async () => {
+      const trace = new PipelineTrace(runtime.sessionId, "voice.greeting");
+      const abortController = new AbortController();
+      runtime.activeTurnAbortController = abortController;
+      runtime.activeTurnTraceId = trace.traceId;
+
+      let audioResponseStarted = false;
+      let totalBytes = 0;
+      let sequence = 0;
+      let interrupted = false;
+      const greetingText = SESSION_GREETING_SEGMENTS.map((segment) => segment.text).join(" ");
+
+      const isGreetingActive = (): boolean =>
+        runtime.activeTurnTraceId === trace.traceId && !abortController.signal.aborted;
+
+      send(runtime.connection, {
+        type: "transcript.final",
+        sessionId: runtime.sessionId,
+        role: "assistant",
+        text: greetingText
+      });
+
+      send(runtime.connection, {
+        type: "server.status",
+        sessionId: runtime.sessionId,
+        phase: "processing",
+        detail: "Playing greeting in English and French."
+      });
+
+      try {
+        for (const segment of SESSION_GREETING_SEGMENTS) {
+          if (!isGreetingActive()) {
+            interrupted = true;
+            break;
+          }
+
+          const segmentStartedAt = Date.now();
+
+          const streamed = await streamElevenLabsTts({
+            text: segment.text,
+            language: segment.language,
+            signal: abortController.signal,
+            onChunk: (chunk) => {
+              if (!isGreetingActive()) {
+                return;
+              }
+
+              if (!audioResponseStarted) {
+                audioResponseStarted = true;
+                send(runtime.connection, {
+                  type: "audio.response.start",
+                  sessionId: runtime.sessionId,
+                  mimeType: "audio/mpeg"
+                });
+              }
+
+              sequence += 1;
+              totalBytes += chunk.byteLength;
+              send(runtime.connection, {
+                type: "audio.response.chunk",
+                sessionId: runtime.sessionId,
+                base64: chunk.toString("base64"),
+                bytes: chunk.byteLength,
+                sequence
+              });
+            }
+          });
+
+          trace.completeStage(
+            `greeting_tts_${segment.language}`,
+            segmentStartedAt,
+            Date.now(),
+            {
+              bytes: streamed.totalBytes,
+              endpointHost: streamed.endpointHost,
+              servedRegion: streamed.servedRegion,
+              voiceId: streamed.voiceId,
+              modelId: streamed.modelId
+            }
+          );
+        }
+
+        if (audioResponseStarted) {
+          send(runtime.connection, {
+            type: "audio.response.end",
+            sessionId: runtime.sessionId,
+            totalBytes
+          });
+        }
+
+        if (interrupted) {
+          trace.flush({
+            status: "interrupted"
+          });
+          send(runtime.connection, {
+            type: "server.status",
+            sessionId: runtime.sessionId,
+            phase: "listening",
+            detail: "Greeting interrupted by user speech. Listening for the next utterance."
+          });
+          return;
+        }
+
+        trace.flush({
+          status: "ok"
+        });
+
+        send(runtime.connection, {
+          type: "server.status",
+          sessionId: runtime.sessionId,
+          phase: "listening",
+          detail: "Greeting delivered. You can start speaking."
+        });
+      } catch (error) {
+        if (isAbortError(error)) {
+          if (audioResponseStarted) {
+            send(runtime.connection, {
+              type: "audio.response.end",
+              sessionId: runtime.sessionId,
+              totalBytes
+            });
+          }
+
+          trace.flush({
+            status: "interrupted"
+          });
+
+          send(runtime.connection, {
+            type: "server.status",
+            sessionId: runtime.sessionId,
+            phase: "listening",
+            detail: "Greeting interrupted by user speech. Listening for the next utterance."
+          });
+          return;
+        }
+
+        const message = error instanceof Error ? error.message : "Greeting playback failed";
+        log("pipeline.trace.failed", {
+          traceId: trace.traceId,
+          sessionId: runtime.sessionId,
+          route: trace.route,
+          message
+        });
+
+        send(runtime.connection, {
+          type: "server.error",
+          message
+        });
+      } finally {
+        if (runtime.activeTurnTraceId === trace.traceId) {
+          runtime.activeTurnAbortController = undefined;
+          runtime.activeTurnTraceId = undefined;
+        }
+      }
+    })
+    .catch((error) => {
+      send(runtime.connection, {
+        type: "server.error",
+        message: error instanceof Error ? error.message : "Unknown greeting pipeline error"
+      });
+    });
+}
+
 export function queueAssistantResponse(
   runtime: RuntimeSessionState,
   transcript: string,
@@ -215,6 +392,9 @@ export function queueAssistantResponse(
   runtime.processing = runtime.processing
     .then(async () => {
       const trace = new PipelineTrace(runtime.sessionId, "voice.utterance");
+      const abortController = new AbortController();
+      runtime.activeTurnAbortController = abortController;
+      runtime.activeTurnTraceId = trace.traceId;
       const requestedLanguage = resolveResponseLanguage(runtime, transcript, context?.requestedLanguage);
       const languageSource = context?.languageSource ?? (requestedLanguage ? "session" : "default");
       const languageLabel = requestedLanguage ? getLanguageDisplayName(requestedLanguage) : "user language";
@@ -241,9 +421,13 @@ export function queueAssistantResponse(
           }
         | undefined;
       let ttsQueue: Promise<void> = Promise.resolve();
+      let interrupted = false;
+
+      const isTurnActive = (): boolean =>
+        runtime.activeTurnTraceId === trace.traceId && !abortController.signal.aborted;
 
       const ensureAudioResponseStarted = (): void => {
-        if (audioResponseStarted) {
+        if (audioResponseStarted || !isTurnActive()) {
           return;
         }
 
@@ -262,6 +446,10 @@ export function queueAssistantResponse(
         }
 
         ttsQueue = ttsQueue.then(async () => {
+          if (!isTurnActive()) {
+            return;
+          }
+
           if (ttsStageStartedAt === undefined) {
             ttsStageStartedAt = Date.now();
             ensureAudioResponseStarted();
@@ -270,7 +458,12 @@ export function queueAssistantResponse(
           const streamedTts = await streamElevenLabsTts({
             text: normalizedSegment,
             language: requestedLanguage,
+            signal: abortController.signal,
             onChunk: (chunk) => {
+              if (!isTurnActive()) {
+                return;
+              }
+
               const chunkSentAt = Date.now();
 
               if (audioFirstChunkSentAt === undefined) {
@@ -308,13 +501,20 @@ export function queueAssistantResponse(
 
       try {
         const embeddingStartedAt = Date.now();
-        const queryEmbedding = await embedText(transcript);
+        const queryEmbedding = await embedText(transcript, {
+          signal: abortController.signal
+        });
         trace.completeStage("openai_embeddings", embeddingStartedAt, Date.now(), {
           inputLength: transcript.length
         });
 
         const retrievalStartedAt = Date.now();
-        const matches = await searchKnowledge(queryEmbedding, 3, SHARED_KNOWLEDGE_SOURCE);
+        const matches = await searchKnowledge(
+          queryEmbedding,
+          3,
+          SHARED_KNOWLEDGE_SOURCE,
+          abortController.signal
+        );
         trace.completeStage("qdrant_query", retrievalStartedAt, Date.now(), {
           hits: matches.length
         });
@@ -323,7 +523,12 @@ export function queueAssistantResponse(
         const completion = await streamGroqCompletion({
           systemPrompt: buildSystemPrompt(matches, requestedLanguage, runtime.ragPrompt),
           userPrompt: transcript,
+          signal: abortController.signal,
           onDelta: (delta) => {
+            if (!isTurnActive()) {
+              return;
+            }
+
             pendingTtsBuffer += delta;
 
             const extracted = extractReadyTtsSegments(pendingTtsBuffer);
@@ -348,6 +553,11 @@ export function queueAssistantResponse(
         });
         completionFirstByteMs = completion.firstByteMs;
 
+        if (!isTurnActive()) {
+          interrupted = true;
+          return;
+        }
+
         send(runtime.connection, {
           type: "transcript.final",
           sessionId: runtime.sessionId,
@@ -370,6 +580,11 @@ export function queueAssistantResponse(
         }
 
         await ttsQueue;
+
+        if (!isTurnActive()) {
+          interrupted = true;
+          return;
+        }
 
         if (ttsStageStartedAt !== undefined) {
           elevenlabsTtsFirstByteMs =
@@ -445,6 +660,29 @@ export function queueAssistantResponse(
           detail: "Response delivered. Listening for the next utterance."
         });
       } catch (error) {
+        if (isAbortError(error)) {
+          interrupted = true;
+          if (audioResponseStarted) {
+            send(runtime.connection, {
+              type: "audio.response.end",
+              sessionId: runtime.sessionId,
+              totalBytes: ttsTotalBytes
+            });
+          }
+
+          trace.flush({
+            status: "interrupted"
+          });
+
+          send(runtime.connection, {
+            type: "server.status",
+            sessionId: runtime.sessionId,
+            phase: "listening",
+            detail: "Current response interrupted by user speech. Listening for the next utterance."
+          });
+          return;
+        }
+
         const message = error instanceof Error ? error.message : "Unknown voice pipeline error";
         log("pipeline.trace.failed", {
           traceId: trace.traceId,
@@ -493,6 +731,15 @@ export function queueAssistantResponse(
           phase: "error",
           detail: "Pipeline failed. Check the event log and try again."
         });
+      } finally {
+        if (runtime.activeTurnTraceId === trace.traceId) {
+          runtime.activeTurnAbortController = undefined;
+          runtime.activeTurnTraceId = undefined;
+        }
+
+        if (interrupted) {
+          pendingTtsBuffer = "";
+        }
       }
     })
     .catch((error) => {
@@ -501,6 +748,26 @@ export function queueAssistantResponse(
         message: error instanceof Error ? error.message : "Unknown queued voice pipeline error"
       });
     });
+}
+
+export function interruptAssistantResponse(
+  runtime: RuntimeSessionState,
+  send: SendFn,
+  reason = "Interrupted by user speech."
+): boolean {
+  const controller = runtime.activeTurnAbortController;
+  if (!controller || controller.signal.aborted) {
+    return false;
+  }
+
+  controller.abort(new DOMException(reason, "AbortError"));
+  send(runtime.connection, {
+    type: "server.status",
+    sessionId: runtime.sessionId,
+    phase: "listening",
+    detail: "Interrupt requested. Stopping the current response."
+  });
+  return true;
 }
 
 function buildSystemPrompt(
@@ -663,4 +930,16 @@ function findLastSoftBoundary(text: string, upTo: number): number {
 
 function normalizeTtsSegment(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function isAbortError(error: unknown): boolean {
+  if (error instanceof DOMException) {
+    return error.name === "AbortError";
+  }
+
+  if (error instanceof Error) {
+    return error.name === "AbortError";
+  }
+
+  return false;
 }

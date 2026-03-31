@@ -4,6 +4,7 @@ interface GroqStreamOptions {
   systemPrompt: string;
   userPrompt: string;
   onDelta: (delta: string) => void;
+  signal?: AbortSignal;
 }
 
 export async function streamGroqCompletion(
@@ -38,7 +39,7 @@ export async function streamGroqCompletion(
         }
       ]
     }),
-    signal: AbortSignal.timeout(30000)
+    signal: withTimeoutSignal(30000, options.signal)
   });
 
   if (!response.ok || !response.body) {
@@ -95,4 +96,8 @@ export async function streamGroqCompletion(
     firstByteMs,
     endpointHost
   };
+}
+
+function withTimeoutSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  return signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs);
 }
