@@ -99,6 +99,16 @@ ws.on("message", (raw, isBinary) => {
     return;
   }
 
+  if (event.type === "audio.response.chunk" && firstAudioAt === undefined) {
+    firstAudioAt = Date.now() - startedAt;
+    stamp("audio.first_chunk", {
+      bytes: event.bytes,
+      sequence: event.sequence,
+      transport: "json"
+    });
+    return;
+  }
+
   if (event.type === "transcript.final" && event.role === "assistant") {
     assistantFinalAt = Date.now() - startedAt;
     stamp("assistant.final", {

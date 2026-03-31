@@ -1,12 +1,12 @@
 FROM node:24 AS build
 WORKDIR /app
 
-COPY package.json ./
+COPY package.json package-lock.json ./
 COPY backend/package.json backend/package.json
 COPY frontend/package.json frontend/package.json
 COPY shared/package.json shared/package.json
 
-RUN npm install
+RUN npm ci
 
 COPY . .
 RUN npm run build
@@ -28,4 +28,3 @@ EXPOSE 3000
 
 WORKDIR /app/backend
 CMD ["node", "dist/server.js"]
-
