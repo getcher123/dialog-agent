@@ -121,6 +121,8 @@ const TARGET_SAMPLE_RATE = 16000;
 const FALLBACK_CAPTURE_BUFFER_SIZE = 1024;
 const PCM_CAPTURE_WORKLET = "pcm16-capture-worklet";
 const PCM_CAPTURE_WORKLET_URL = new URL("./pcm16-capture-worklet.js", import.meta.url);
+const MAX_EVENT_ROWS = 120;
+const MAX_CHAT_BUBBLES = 80;
 
 let socket: WebSocket | null = null;
 let sessionId = "n/a";
@@ -143,6 +145,8 @@ let ragPromptSyncTimer: number | null = null;
 let lastSyncedRagPrompt = normalizePrompt(ragPromptInput.value);
 const defaultRagPrompt = lastSyncedRagPrompt;
 let lastInterruptRequestAt = 0;
+let socketGeneration = 0;
+let isStoppingSession = false;
 
 startButton.addEventListener("click", () => {
   void startSession();
@@ -190,6 +194,7 @@ async function startSession(): Promise<void> {
   const hadOpenSocket = socket?.readyState === WebSocket.OPEN;
 
   try {
+    isStoppingSession = false;
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -233,9 +238,41 @@ async function startSession(): Promise<void> {
 }
 
 function stopSession(): void {
-  if (socket) {
-    socket.close();
-    socket = null;
+  isStoppingSession = true;
+  assistantPartialBubble = null;
+  lastInterruptRequestAt = 0;
+
+  const closingSocket = socket;
+  if (closingSocket?.readyState === WebSocket.OPEN) {
+    try {
+      closingSocket.send(
+        JSON.stringify({
+          type: "turn.interrupt",
+          reason: "Session stopped by user."
+        })
+      );
+    } catch {
+      // Ignore close-race failures from the browser WebSocket stack.
+    }
+  }
+
+  socket = null;
+  socketConnectPromise = null;
+
+  if (captureNode instanceof AudioWorkletNode) {
+    captureNode.port.onmessage = null;
+    captureNode.disconnect();
+  } else if (captureNode instanceof ScriptProcessorNode) {
+    captureNode.onaudioprocess = null;
+    captureNode.disconnect();
+  }
+
+  microphoneSource?.disconnect();
+  analyser?.disconnect();
+  silentGain?.disconnect();
+
+  if (closingSocket) {
+    closingSocket.close();
   }
 
   if (mediaStream) {
@@ -330,20 +367,27 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
     ? `${configuredOrigin.replace(/\/$/, "").replace(/^http/, "ws")}/ws`
     : `${protocol}://${host}/ws`;
 
-  socket = new WebSocket(url);
-  socket.binaryType = "arraybuffer";
+  const currentGeneration = ++socketGeneration;
+  const currentSocket = new WebSocket(url);
+  socket = currentSocket;
+  currentSocket.binaryType = "arraybuffer";
   wsStatus.textContent = "connecting";
   triggerStatus.textContent = "arming";
   setConnectionState("connecting");
+  isStoppingSession = false;
 
-  socket.addEventListener("open", () => {
+  currentSocket.addEventListener("open", () => {
+    if (socket !== currentSocket || currentGeneration !== socketGeneration) {
+      return;
+    }
+
     wsStatus.textContent = "connected";
     sendTextButton.disabled = false;
     updateKnowledgeUiState(false, knowledgeInput.value.trim() ? "shared / stale" : "empty");
     addEventRow("Client", `WS connected: ${url}`);
     syncRagPromptToServer(true);
 
-    socket?.send(
+    currentSocket.send(
       JSON.stringify({
         type: "session.start",
         sampleRate: TARGET_SAMPLE_RATE
@@ -355,7 +399,7 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
     window.setTimeout(() => {
       if (socket?.readyState === WebSocket.OPEN) {
         lastPingAt = Date.now();
-        socket.send(
+        currentSocket.send(
           JSON.stringify({
             type: "client.ping",
             at: lastPingAt
@@ -365,12 +409,25 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
     }, 400);
   });
 
-  socket.addEventListener("message", (event) => {
+  currentSocket.addEventListener("message", (event) => {
+    if (socket !== currentSocket || currentGeneration !== socketGeneration || isStoppingSession) {
+      return;
+    }
+
     void handleSocketMessage(event);
   });
 
-  socket.addEventListener("close", () => {
+  currentSocket.addEventListener("close", () => {
+    if (socket === currentSocket) {
+      socket = null;
+    }
+
     socketConnectPromise = null;
+
+    if (currentGeneration !== socketGeneration) {
+      return;
+    }
+
     wsStatus.textContent = "closed";
     sendTextButton.disabled = false;
     applyKnowledgeButton.disabled = isIndexingKnowledge || !knowledgeInput.value.trim();
@@ -378,7 +435,11 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
     addEventRow("Client", "WS connection closed.");
   });
 
-  socket.addEventListener("error", (event) => {
+  currentSocket.addEventListener("error", (event) => {
+    if (socket === currentSocket) {
+      socket = null;
+    }
+
     socketConnectPromise = null;
     reject?.(event);
   });
@@ -663,6 +724,10 @@ function addEventRow(title: string, body: string): void {
   row.className = "event-row";
   row.innerHTML = `<strong>${escapeHtml(title)}</strong><span>${escapeHtml(body)}</span>`;
   eventsLog.prepend(row);
+
+  while (eventsLog.childElementCount > MAX_EVENT_ROWS) {
+    eventsLog.lastElementChild?.remove();
+  }
 }
 
 function appendChatBubble(role: "user" | "assistant", text: string): HTMLElement {
@@ -670,6 +735,11 @@ function appendChatBubble(role: "user" | "assistant", text: string): HTMLElement
   bubble.className = `chat-bubble chat-bubble-${role}`;
   bubble.innerHTML = `<strong>${role === "user" ? "You" : "Assistant"}</strong><p>${escapeHtml(text)}</p>`;
   chatLog.appendChild(bubble);
+
+  while (chatLog.childElementCount > MAX_CHAT_BUBBLES) {
+    chatLog.firstElementChild?.remove();
+  }
+
   chatLog.scrollTop = chatLog.scrollHeight;
   return bubble;
 }
