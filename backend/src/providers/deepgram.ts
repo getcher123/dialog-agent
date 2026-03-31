@@ -34,7 +34,7 @@ export function connectDeepgramStream(
     smart_format: "true",
     interim_results: "true",
     endpointing: "200",
-    utterance_end_ms: "700",
+    utterance_end_ms: "1000",
     vad_events: "true"
   });
 
@@ -93,6 +93,21 @@ export function connectDeepgramStream(
 
   socket.on("error", (error) => {
     callbacks.onError(error instanceof Error ? error.message : "Deepgram socket error");
+  });
+
+  socket.on("unexpected-response", (_request, response) => {
+    callbacks.onError(
+      `Deepgram unexpected response: ${response.statusCode ?? "unknown"} ${response.statusMessage ?? ""}`.trim()
+    );
+  });
+
+  socket.on("close", (code, reason) => {
+    if (code === 1000 || code === 1005) {
+      return;
+    }
+
+    const detail = reason.toString().trim();
+    callbacks.onError(`Deepgram socket closed: ${code}${detail ? ` ${detail}` : ""}`);
   });
 
   return socket;
