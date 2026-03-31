@@ -38,10 +38,10 @@ export interface RuntimeSessionState {
 type SendFn = (connection: WebSocket, event: ServerEvent) => void;
 const SHARED_KNOWLEDGE_SOURCE = "shared-ui-knowledge";
 export const DEFAULT_RAG_PROMPT = [
-  "Ты отвечаешь как голосовой RAG-ассистент.",
+  "Ты отвечаешь как телефонный консультант.",
   "Используй контекст ниже, если он релевантен.",
   "Если контекста не хватает, скажи об этом прямо.",
-  "Если ссылаешься на источник, используй формат [chunk-N]."
+  "Отвечай кратко, короткими односложными предложениями."
 ].join("\n");
 
 export interface VoiceLatencyContext {
