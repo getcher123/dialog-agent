@@ -1,4 +1,5 @@
 import "./styles.css";
+import { isUiLanguage, translations, type UiLanguage, type UiTranslationKey } from "./i18n";
 
 type ServerEvent =
   | { type: "connection.ready"; sessionId: string }
@@ -79,6 +80,7 @@ const applyKnowledgeButton = getRequiredElement<HTMLButtonElement>("#apply-knowl
 const sendTextButton = getRequiredElement<HTMLButtonElement>("#send-text");
 const resetRagPromptButton = getRequiredElement<HTMLButtonElement>("#reset-rag-prompt");
 const knowledgeInput = getRequiredElement<HTMLTextAreaElement>("#knowledge-input");
+const knowledgeSafetyConfirmation = getRequiredElement<HTMLInputElement>("#knowledge-safety-confirmation");
 const textMessageInput = getRequiredElement<HTMLTextAreaElement>("#text-message-input");
 const ragPromptInput = getRequiredElement<HTMLTextAreaElement>("#rag-prompt-input");
 const eventsLog = getRequiredElement<HTMLDivElement>("#events-log");
@@ -103,6 +105,17 @@ const waveform = getRequiredElement<HTMLCanvasElement>("#waveform");
 const knowledgeProgressLabel = getRequiredElement<HTMLElement>("#knowledge-progress-label");
 const knowledgeProgressValue = getRequiredElement<HTMLElement>("#knowledge-progress-value");
 const knowledgeProgressFill = getRequiredElement<HTMLElement>("#knowledge-progress-fill");
+const languageButtons = Array.from(
+  document.querySelectorAll<HTMLButtonElement>("[data-language-option]")
+);
+const onboardingHelpButton = getRequiredElement<HTMLButtonElement>("#onboarding-help");
+const onboardingBackdrop = getRequiredElement<HTMLDivElement>("#onboarding-backdrop");
+const onboardingTooltip = getRequiredElement<HTMLElement>("#onboarding-tooltip");
+const onboardingProgress = getRequiredElement<HTMLElement>("#onboarding-progress");
+const onboardingTitle = getRequiredElement<HTMLElement>("#onboarding-title");
+const onboardingBody = getRequiredElement<HTMLElement>("#onboarding-body");
+const onboardingNextButton = getRequiredElement<HTMLButtonElement>("#onboarding-next");
+const onboardingSkipButton = getRequiredElement<HTMLButtonElement>("#onboarding-skip");
 
 interface AudioStreamPlayback {
   audio: HTMLAudioElement;
@@ -123,6 +136,63 @@ const PCM_CAPTURE_WORKLET = "pcm16-capture-worklet";
 const PCM_CAPTURE_WORKLET_URL = new URL("./pcm16-capture-worklet.js", import.meta.url);
 const MAX_EVENT_ROWS = 120;
 const MAX_CHAT_BUBBLES = 80;
+const LANGUAGE_STORAGE_KEY = "voice-agent-ui-language";
+const ONBOARDING_STORAGE_KEY = "voice-agent-onboarding-completed";
+
+type TranslatedTextRenderer = () => string;
+type ConnectionState = "idle" | "connecting" | "live";
+type TourPlacement = "top" | "right" | "bottom" | "left";
+type TourStep = {
+  targetSelector: string;
+  titleKey: UiTranslationKey;
+  bodyKey: UiTranslationKey;
+  placement: TourPlacement;
+};
+
+const latencySlots = {
+  total: latencyStatus,
+  stt: sttLatencyStatus,
+  openaiEmbeddings: openaiEmbeddingsStatus,
+  qdrantQuery: qdrantQueryStatus,
+  groqCompletion: groqCompletionStatus,
+  elevenlabsFirstByte: elevenlabsFirstByteStatus,
+  voiceFirstAudio: voiceFirstAudioStatus
+} as const;
+
+type LatencySlot = keyof typeof latencySlots;
+
+const ONBOARDING_STEPS: TourStep[] = [
+  {
+    targetSelector: "#language-switch",
+    titleKey: "onboardingLanguageTitle",
+    bodyKey: "onboardingLanguageBody",
+    placement: "bottom"
+  },
+  {
+    targetSelector: "#knowledge-input",
+    titleKey: "onboardingKnowledgeTitle",
+    bodyKey: "onboardingKnowledgeBody",
+    placement: "right"
+  },
+  {
+    targetSelector: ".waveform-chat-shell",
+    titleKey: "onboardingChatTitle",
+    bodyKey: "onboardingChatBody",
+    placement: "top"
+  },
+  {
+    targetSelector: "#start-button",
+    titleKey: "onboardingVoiceTitle",
+    bodyKey: "onboardingVoiceBody",
+    placement: "bottom"
+  },
+  {
+    targetSelector: ".session-card",
+    titleKey: "onboardingStatusTitle",
+    bodyKey: "onboardingStatusBody",
+    placement: "top"
+  }
+];
 
 let socket: WebSocket | null = null;
 let sessionId = "n/a";
@@ -147,6 +217,75 @@ const defaultRagPrompt = lastSyncedRagPrompt;
 let lastInterruptRequestAt = 0;
 let socketGeneration = 0;
 let isStoppingSession = false;
+let currentLanguage: UiLanguage = getInitialLanguage();
+let connectionState: ConnectionState = "idle";
+let micStatusKey: UiTranslationKey = "statusOff";
+let wsStatusKey: UiTranslationKey = "statusDisconnected";
+let triggerStatusKey: UiTranslationKey = "statusNotArmed";
+let processingStatusKey: UiTranslationKey = "statusIdle";
+let ragPromptStatusKey: UiTranslationKey = "ragPromptStatusLocalDefault";
+let pipelineHintRenderer: TranslatedTextRenderer = () => t("pipelineHintInitial");
+let knowledgeStatusRenderer: TranslatedTextRenderer = () => t("statusEmpty");
+let knowledgeProgressLabelRenderer: TranslatedTextRenderer = () => t("knowledgeProgressIdle");
+let knowledgeProgressDetailRenderer: TranslatedTextRenderer = () => t("knowledgeProgressIdle");
+let latencyState: Record<LatencySlot, { value?: number; fallbackKey: UiTranslationKey }> = {
+  total: { fallbackKey: "statusPending" },
+  stt: { fallbackKey: "statusPending" },
+  openaiEmbeddings: { fallbackKey: "statusPending" },
+  qdrantQuery: { fallbackKey: "statusPending" },
+  groqCompletion: { fallbackKey: "statusPending" },
+  elevenlabsFirstByte: { fallbackKey: "statusPending" },
+  voiceFirstAudio: { fallbackKey: "statusPending" }
+};
+let activeOnboardingStepIndex = -1;
+let activeOnboardingTarget: HTMLElement | null = null;
+
+languageButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    const language = button.dataset.languageOption;
+    if (isUiLanguage(language)) {
+      setLanguage(language);
+    }
+  });
+});
+
+onboardingNextButton.addEventListener("click", () => {
+  advanceOnboardingTour();
+});
+
+onboardingSkipButton.addEventListener("click", () => {
+  completeOnboardingTour();
+});
+
+onboardingHelpButton.addEventListener("click", () => {
+  startOnboardingTour();
+});
+
+window.addEventListener(
+  "resize",
+  () => {
+    if (isOnboardingActive()) {
+      positionOnboardingTooltip();
+    }
+  },
+  { passive: true }
+);
+
+window.addEventListener(
+  "scroll",
+  () => {
+    if (isOnboardingActive()) {
+      positionOnboardingTooltip();
+    }
+  },
+  { passive: true }
+);
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && isOnboardingActive()) {
+    completeOnboardingTour();
+  }
+});
 
 startButton.addEventListener("click", () => {
   void startSession();
@@ -166,16 +305,25 @@ sendTextButton.addEventListener("click", () => {
 
 resetRagPromptButton.addEventListener("click", () => {
   ragPromptInput.value = defaultRagPrompt;
-  setRagPromptStatus(socket?.readyState === WebSocket.OPEN ? "Syncing..." : "Local default");
+  setRagPromptStatus(
+    socket?.readyState === WebSocket.OPEN ? "ragPromptStatusSyncing" : "ragPromptStatusLocalDefault"
+  );
   scheduleRagPromptSync(true);
 });
 
 knowledgeInput.addEventListener("input", () => {
-  updateKnowledgeUiState(isIndexingKnowledge, knowledgeStatus.textContent ?? "empty");
+  knowledgeSafetyConfirmation.checked = false;
+  updateKnowledgeUiState(isIndexingKnowledge);
+});
+
+knowledgeSafetyConfirmation.addEventListener("change", () => {
+  updateKnowledgeUiState(isIndexingKnowledge);
 });
 
 ragPromptInput.addEventListener("input", () => {
-  setRagPromptStatus(socket?.readyState === WebSocket.OPEN ? "Syncing..." : "Saved locally");
+  setRagPromptStatus(
+    socket?.readyState === WebSocket.OPEN ? "ragPromptStatusSyncing" : "ragPromptStatusSavedLocally"
+  );
   scheduleRagPromptSync(false);
 });
 
@@ -203,10 +351,10 @@ async function startSession(): Promise<void> {
         autoGainControl: true
       }
     });
-    micStatus.textContent = "live";
-    triggerStatus.textContent = "waiting for speech";
-    processingStatus.textContent = "idle";
-    pipelineHint.textContent = "Microphone open. Start speaking. Inference begins after a short pause in speech.";
+    setMicStatus("statusLiveMic");
+    setTriggerStatus("statusWaitingForSpeech");
+    setProcessingStatus("statusIdle");
+    setPipelineHint("pipelineHintMicOpen");
     startButton.disabled = true;
     stopButton.disabled = false;
 
@@ -229,9 +377,9 @@ async function startSession(): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Microphone permission failed";
     addEventRow("Client", `Microphone error: ${message}`);
-    micStatus.textContent = "error";
-    triggerStatus.textContent = "blocked";
-    pipelineHint.textContent = "Microphone access is required for voice mode.";
+    setMicStatus("statusError");
+    setTriggerStatus("statusBlocked");
+    setPipelineHint("pipelineHintMicRequired");
     startButton.disabled = false;
     stopButton.disabled = true;
   }
@@ -299,18 +447,18 @@ function stopSession(): void {
   assistantPartialBubble = null;
   updateSessionId();
   setConnectionState("idle");
-  micStatus.textContent = "off";
-  wsStatus.textContent = "disconnected";
-  latencyStatus.textContent = "pending";
+  setMicStatus("statusOff");
+  setWsStatus("statusDisconnected");
+  setLatencySlot("total", undefined, "statusPending");
   resetLatencyBreakdown();
-  triggerStatus.textContent = "not armed";
-  processingStatus.textContent = "idle";
-  pipelineHint.textContent = "Press Start. Trigger happens automatically after speech pause is detected.";
+  setTriggerStatus("statusNotArmed");
+  setProcessingStatus("statusIdle");
+  setPipelineHint("pipelineHintInitial");
   lastInterruptRequestAt = 0;
   startButton.disabled = false;
   stopButton.disabled = true;
   sendTextButton.disabled = false;
-  updateKnowledgeUiState(false, knowledgeInput.value.trim() ? knowledgeStatus.textContent ?? "shared" : "empty");
+  updateKnowledgeUiState(false, knowledgeInput.value.trim() ? undefined : createTextRenderer("statusEmpty"));
 }
 
 async function sendKnowledgeForIndexing(): Promise<void> {
@@ -325,9 +473,19 @@ async function sendKnowledgeForIndexing(): Promise<void> {
     return;
   }
 
+  if (!knowledgeSafetyConfirmation.checked) {
+    addEventRow("Client", "Подтвердите, что KB не содержит чувствительных данных, перед индексацией.");
+    updateKnowledgeUiState(false);
+    return;
+  }
+
   await ensureSocketConnected();
-  updateKnowledgeUiState(true, "indexing...");
-  updateKnowledgeProgress(4, "Preparing shared indexing session.");
+  updateKnowledgeUiState(true, createTextRenderer("statusIndexing"));
+  updateKnowledgeProgress(
+    4,
+    createTextRenderer("knowledgeProgressPreparingDetail"),
+    createTextRenderer("knowledgeProgressPreparingLabel")
+  );
   addEventRow("Client", "Knowledge indexing requested.");
   socket?.send(
     JSON.stringify({
@@ -371,8 +529,8 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
   const currentSocket = new WebSocket(url);
   socket = currentSocket;
   currentSocket.binaryType = "arraybuffer";
-  wsStatus.textContent = "connecting";
-  triggerStatus.textContent = "arming";
+  setWsStatus("statusConnecting");
+  setTriggerStatus("statusArming");
   setConnectionState("connecting");
   isStoppingSession = false;
 
@@ -381,9 +539,12 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
       return;
     }
 
-    wsStatus.textContent = "connected";
+    setWsStatus("statusConnected");
     sendTextButton.disabled = false;
-    updateKnowledgeUiState(false, knowledgeInput.value.trim() ? "shared / stale" : "empty");
+    updateKnowledgeUiState(
+      false,
+      knowledgeInput.value.trim() ? createTextRenderer("statusSharedStale") : createTextRenderer("statusEmpty")
+    );
     addEventRow("Client", `WS connected: ${url}`);
     syncRagPromptToServer(true);
 
@@ -428,9 +589,9 @@ function connectWebSocket(resolve?: () => void, reject?: (reason?: unknown) => v
       return;
     }
 
-    wsStatus.textContent = "closed";
+    setWsStatus("statusClosed");
     sendTextButton.disabled = false;
-    applyKnowledgeButton.disabled = isIndexingKnowledge || !knowledgeInput.value.trim();
+    updateKnowledgeUiState(isIndexingKnowledge);
     setConnectionState("idle");
     addEventRow("Client", "WS connection closed.");
   });
@@ -496,11 +657,9 @@ function handleServerEvent(event: ServerEvent): void {
       sessionId = event.sessionId;
       updateSessionId();
       setConnectionState("live");
-      triggerStatus.textContent = mediaStream ? "listening" : "text ready";
-      processingStatus.textContent = "ready";
-      pipelineHint.textContent = mediaStream
-        ? "Voice trigger is automatic: speak, pause briefly, then inference starts."
-        : "Connection is ready for text dialogue and knowledge indexing. Press Start only when you want live microphone mode.";
+      setTriggerStatus(mediaStream ? "statusListening" : "statusTextReady");
+      setProcessingStatus("statusReady");
+      setPipelineHint(mediaStream ? "pipelineHintVoiceReady" : "pipelineHintTextReady");
       addEventRow("Server", `Session started: ${event.sessionId}`);
       return;
 
@@ -513,30 +672,36 @@ function handleServerEvent(event: ServerEvent): void {
 
     case "knowledge.indexing":
       if (event.status === "started") {
-        updateKnowledgeUiState(true, "indexing...");
+        updateKnowledgeUiState(true, createTextRenderer("statusIndexing"));
         updateKnowledgeProgress(
           event.progressPercent ?? 8,
           event.message,
-          event.stage ? `Stage: ${event.stage}` : "Indexing"
+          event.stage
+            ? () => `${t("knowledgeProgressStagePrefix")} ${event.stage}`
+            : createTextRenderer("buttonIndexing")
         );
       }
 
       if (event.status === "completed") {
-        updateKnowledgeUiState(false, "shared / ready");
-        updateKnowledgeProgress(100, event.message, "Completed");
+        updateKnowledgeUiState(false, createTextRenderer("statusSharedReady"));
+        updateKnowledgeProgress(100, event.message, createTextRenderer("knowledgeProgressCompleted"));
       }
 
       if (event.status === "failed") {
-        updateKnowledgeUiState(false, "index failed");
-        updateKnowledgeProgress(100, event.message, "Failed");
+        updateKnowledgeUiState(false, createTextRenderer("statusIndexFailed"));
+        updateKnowledgeProgress(100, event.message, createTextRenderer("knowledgeProgressFailed"));
       }
 
       addEventRow("Knowledge", `${event.scope}: ${event.message}`);
       return;
 
     case "knowledge.indexed":
-      updateKnowledgeUiState(false, `shared / ${event.chunks} chunks`);
-      updateKnowledgeProgress(100, `Indexed ${event.chunks} chunks for shared retrieval.`, "Completed");
+      updateKnowledgeUiState(false, createTextRenderer("statusSharedChunks", { chunks: event.chunks }));
+      updateKnowledgeProgress(
+        100,
+        createTextRenderer("knowledgeIndexedDetail", { chunks: event.chunks }),
+        createTextRenderer("knowledgeProgressCompleted")
+      );
       addEventRow(
         "Server",
         `Markdown indexed. ${event.characters} chars, ${event.lines} lines, ${event.chunks} chunks. Available to future sessions.`
@@ -559,7 +724,7 @@ function handleServerEvent(event: ServerEvent): void {
         upsertAssistantPartialBubble(event.text);
       } else {
         maybeInterruptAssistantResponse();
-        triggerStatus.textContent = "speech detected";
+        setTriggerStatus("statusSpeechDetected");
       }
       return;
 
@@ -592,9 +757,9 @@ function handleServerEvent(event: ServerEvent): void {
       return;
 
     case "pipeline.metrics":
-      latencyStatus.textContent = `${event.totalMs} ms`;
+      setLatencySlot("total", event.totalMs);
       updateLatencyBreakdown(event);
-      processingStatus.textContent = "done";
+      setProcessingStatus("statusDone");
       {
         const extras = [
           event.elevenlabsTtsFirstByteMs !== undefined
@@ -623,7 +788,7 @@ function handleServerEvent(event: ServerEvent): void {
       return;
 
     case "server.error":
-      processingStatus.textContent = "error";
+      setProcessingStatus("statusError");
       addEventRow("Error", event.message);
       return;
   }
@@ -631,7 +796,7 @@ function handleServerEvent(event: ServerEvent): void {
 
 function maybeInterruptAssistantResponse(): void {
   const playbackActive = Boolean(activeAudio || activeAudioStream);
-  const pipelineRunning = processingStatus.textContent === "running";
+  const pipelineRunning = processingStatusKey === "statusRunning";
 
   if (!playbackActive && !pipelineRunning) {
     return;
@@ -652,7 +817,7 @@ function maybeInterruptAssistantResponse(): void {
   }
 
   lastInterruptRequestAt = now;
-  processingStatus.textContent = "interrupting";
+  setProcessingStatus("statusInterrupting");
   socket.send(
     JSON.stringify({
       type: "turn.interrupt",
@@ -663,33 +828,33 @@ function maybeInterruptAssistantResponse(): void {
 }
 
 function reflectPipelineStatus(phase: string, detail: string): void {
-  pipelineHint.textContent = detail;
+  setPipelineHintRaw(detail);
 
   if (phase === "idle") {
-    triggerStatus.textContent = "idle";
-    processingStatus.textContent = "idle";
+    setTriggerStatus("statusIdle");
+    setProcessingStatus("statusIdle");
     return;
   }
 
   if (phase === "connected" || phase === "listening") {
-    triggerStatus.textContent = "listening";
-    processingStatus.textContent = "armed";
+    setTriggerStatus("statusListening");
+    setProcessingStatus("statusArmed");
     return;
   }
 
   if (phase === "processing") {
-    triggerStatus.textContent = "triggered";
-    processingStatus.textContent = "running";
+    setTriggerStatus("statusTriggered");
+    setProcessingStatus("statusRunning");
     return;
   }
 
   if (phase === "knowledge_ready") {
-    processingStatus.textContent = "knowledge ready";
+    setProcessingStatus("statusKnowledgeReady");
     return;
   }
 
   if (phase === "error") {
-    processingStatus.textContent = "error";
+    setProcessingStatus("statusError");
   }
 }
 
@@ -698,25 +863,21 @@ function updateLatencyBreakdown(
 ): void {
   const stages = new Map(event.stages.map((stage) => [stage.name, stage.durationMs]));
 
-  sttLatencyStatus.textContent = formatLatency(event.sttFinalizeMs, "n/a");
-  openaiEmbeddingsStatus.textContent = formatLatency(stages.get("openai_embeddings"));
-  qdrantQueryStatus.textContent = formatLatency(stages.get("qdrant_query"));
-  groqCompletionStatus.textContent = formatLatency(stages.get("groq_completion"));
-  elevenlabsFirstByteStatus.textContent = formatLatency(event.elevenlabsTtsFirstByteMs);
-  voiceFirstAudioStatus.textContent = formatLatency(event.voiceToAudioFirstByteMs, "n/a");
+  setLatencySlot("stt", event.sttFinalizeMs, "statusNotAvailable");
+  setLatencySlot("openaiEmbeddings", stages.get("openai_embeddings"));
+  setLatencySlot("qdrantQuery", stages.get("qdrant_query"));
+  setLatencySlot("groqCompletion", stages.get("groq_completion"));
+  setLatencySlot("elevenlabsFirstByte", event.elevenlabsTtsFirstByteMs);
+  setLatencySlot("voiceFirstAudio", event.voiceToAudioFirstByteMs, "statusNotAvailable");
 }
 
 function resetLatencyBreakdown(): void {
-  sttLatencyStatus.textContent = "pending";
-  openaiEmbeddingsStatus.textContent = "pending";
-  qdrantQueryStatus.textContent = "pending";
-  groqCompletionStatus.textContent = "pending";
-  elevenlabsFirstByteStatus.textContent = "pending";
-  voiceFirstAudioStatus.textContent = "pending";
-}
-
-function formatLatency(value: number | undefined, fallback = "pending"): string {
-  return value !== undefined ? `${value} ms` : fallback;
+  setLatencySlot("stt", undefined, "statusPending");
+  setLatencySlot("openaiEmbeddings", undefined, "statusPending");
+  setLatencySlot("qdrantQuery", undefined, "statusPending");
+  setLatencySlot("groqCompletion", undefined, "statusPending");
+  setLatencySlot("elevenlabsFirstByte", undefined, "statusPending");
+  setLatencySlot("voiceFirstAudio", undefined, "statusPending");
 }
 
 function addEventRow(title: string, body: string): void {
@@ -733,7 +894,8 @@ function addEventRow(title: string, body: string): void {
 function appendChatBubble(role: "user" | "assistant", text: string): HTMLElement {
   const bubble = document.createElement("article");
   bubble.className = `chat-bubble chat-bubble-${role}`;
-  bubble.innerHTML = `<strong>${role === "user" ? "You" : "Assistant"}</strong><p>${escapeHtml(text)}</p>`;
+  bubble.dataset.chatRole = role;
+  bubble.innerHTML = `<strong data-chat-role-label>${escapeHtml(getChatRoleLabel(role))}</strong><p>${escapeHtml(text)}</p>`;
   chatLog.appendChild(bubble);
 
   while (chatLog.childElementCount > MAX_CHAT_BUBBLES) {
@@ -773,11 +935,16 @@ function finalizeAssistantBubble(text: string): void {
   chatLog.scrollTop = chatLog.scrollHeight;
 }
 
-function updateKnowledgeUiState(isIndexing: boolean, label: string): void {
+function updateKnowledgeUiState(isIndexing: boolean, labelRenderer?: TranslatedTextRenderer): void {
   isIndexingKnowledge = isIndexing;
-  knowledgeStatus.textContent = label;
-  applyKnowledgeButton.disabled = isIndexing || !knowledgeInput.value.trim();
-  applyKnowledgeButton.textContent = isIndexing ? "Indexing..." : "Index Markdown";
+  if (labelRenderer) {
+    knowledgeStatusRenderer = labelRenderer;
+  }
+  knowledgeStatus.textContent = knowledgeStatusRenderer();
+  const hasKnowledge = Boolean(knowledgeInput.value.trim());
+  const canIndexKnowledge = hasKnowledge && knowledgeSafetyConfirmation.checked;
+  applyKnowledgeButton.disabled = isIndexing || !canIndexKnowledge;
+  applyKnowledgeButton.textContent = t(isIndexing ? "buttonIndexing" : "buttonIndexMarkdown");
 }
 
 function scheduleRagPromptSync(force: boolean): void {
@@ -795,12 +962,16 @@ function syncRagPromptToServer(force = false): void {
   const prompt = normalizePrompt(ragPromptInput.value);
 
   if (!force && prompt === lastSyncedRagPrompt) {
-    setRagPromptStatus(prompt === defaultRagPrompt ? "Local default" : "Synced");
+    setRagPromptStatus(
+      prompt === defaultRagPrompt ? "ragPromptStatusLocalDefault" : "ragPromptStatusSynced"
+    );
     return;
   }
 
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    setRagPromptStatus(prompt === defaultRagPrompt ? "Local default" : "Saved locally");
+    setRagPromptStatus(
+      prompt === defaultRagPrompt ? "ragPromptStatusLocalDefault" : "ragPromptStatusSavedLocally"
+    );
     return;
   }
 
@@ -811,25 +982,35 @@ function syncRagPromptToServer(force = false): void {
     })
   );
   lastSyncedRagPrompt = prompt;
-  setRagPromptStatus(prompt === defaultRagPrompt ? "Default synced" : "Synced");
+  setRagPromptStatus(
+    prompt === defaultRagPrompt ? "ragPromptStatusDefaultSynced" : "ragPromptStatusSynced"
+  );
 }
 
-function setRagPromptStatus(label: string): void {
-  ragPromptStatus.textContent = label;
+function setRagPromptStatus(labelKey: UiTranslationKey): void {
+  ragPromptStatusKey = labelKey;
+  ragPromptStatus.textContent = t(labelKey);
 }
 
 function normalizePrompt(value: string): string {
   return value.trim().replace(/\r\n/g, "\n");
 }
 
-function updateKnowledgeProgress(percent: number, detail: string, label?: string): void {
+function updateKnowledgeProgress(
+  percent: number,
+  detail: string | TranslatedTextRenderer,
+  label?: string | TranslatedTextRenderer
+): void {
   const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+  knowledgeProgressDetailRenderer = toTextRenderer(detail);
+  knowledgeProgressLabelRenderer = label ? toTextRenderer(label) : knowledgeProgressDetailRenderer;
   knowledgeProgressFill.style.width = `${clamped}%`;
   knowledgeProgressValue.textContent = `${clamped}%`;
-  knowledgeProgressLabel.textContent = label ?? detail;
-  if (detail) {
-    knowledgeProgressFill.title = detail;
-    knowledgeProgressLabel.setAttribute("title", detail);
+  knowledgeProgressLabel.textContent = knowledgeProgressLabelRenderer();
+  const detailText = knowledgeProgressDetailRenderer();
+  if (detailText) {
+    knowledgeProgressFill.title = detailText;
+    knowledgeProgressLabel.setAttribute("title", detailText);
   }
 }
 
@@ -1075,11 +1256,15 @@ function decodeBase64(base64: string): ArrayBuffer {
 }
 
 function updateSessionId(): void {
-  sessionIdLabel.textContent = `session: ${sessionId}`;
+  const displaySessionId = sessionId === "n/a" ? t("statusNotAvailable") : sessionId;
+  sessionIdLabel.textContent = `${t("sessionLabelPrefix")}: ${displaySessionId}`;
 }
 
-function setConnectionState(state: "idle" | "connecting" | "live"): void {
-  connectionPill.textContent = state;
+function setConnectionState(state: ConnectionState): void {
+  connectionState = state;
+  const labelKey: UiTranslationKey =
+    state === "live" ? "statusLive" : state === "connecting" ? "statusConnecting" : "statusIdle";
+  connectionPill.textContent = t(labelKey);
   connectionPill.className = `pill ${state === "live" ? "pill-live" : "pill-idle"}`;
 }
 
@@ -1301,6 +1486,385 @@ function startIdleWaveform(): void {
   renderIdleWaveform();
 }
 
+function getInitialLanguage(): UiLanguage {
+  try {
+    const storedLanguage = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    if (isUiLanguage(storedLanguage)) {
+      return storedLanguage;
+    }
+  } catch {
+    // localStorage can be unavailable in private or restricted browser contexts.
+  }
+
+  return getBrowserLanguage();
+}
+
+function getBrowserLanguage(): UiLanguage {
+  const primaryLanguage = navigator.languages?.[0] ?? navigator.language ?? "";
+  return primaryLanguage.toLowerCase().startsWith("ru") ? "ru" : "en";
+}
+
+function setLanguage(language: UiLanguage): void {
+  currentLanguage = language;
+
+  try {
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
+  } catch {
+    // Persisting the UI preference is best-effort.
+  }
+
+  applyLanguage();
+}
+
+function applyLanguage(): void {
+  document.documentElement.lang = currentLanguage;
+  document.title = t("pageTitle");
+
+  document.querySelectorAll<HTMLElement>("[data-i18n]").forEach((element) => {
+    const key = getTranslationKey(element.dataset.i18n);
+    if (key) {
+      element.textContent = t(key);
+    }
+  });
+
+  document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("[data-i18n-placeholder]").forEach((element) => {
+    const key = getTranslationKey(element.dataset.i18nPlaceholder);
+    if (key) {
+      element.placeholder = t(key);
+    }
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-i18n-aria-label]").forEach((element) => {
+    const key = getTranslationKey(element.dataset.i18nAriaLabel);
+    if (key) {
+      element.setAttribute("aria-label", t(key));
+    }
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-i18n-title]").forEach((element) => {
+    const key = getTranslationKey(element.dataset.i18nTitle);
+    if (key) {
+      element.setAttribute("title", t(key));
+    }
+  });
+
+  renderLanguageButtons();
+  renderDynamicUi();
+}
+
+function renderLanguageButtons(): void {
+  languageButtons.forEach((button) => {
+    const isActive = button.dataset.languageOption === currentLanguage;
+    button.setAttribute("aria-pressed", String(isActive));
+  });
+}
+
+function renderDynamicUi(): void {
+  setConnectionState(connectionState);
+  setMicStatus(micStatusKey);
+  setWsStatus(wsStatusKey);
+  setTriggerStatus(triggerStatusKey);
+  setProcessingStatus(processingStatusKey);
+  setRagPromptStatus(ragPromptStatusKey);
+  renderLatencySlots();
+  updateSessionId();
+  pipelineHint.textContent = pipelineHintRenderer();
+  knowledgeStatus.textContent = knowledgeStatusRenderer();
+  applyKnowledgeButton.textContent = t(isIndexingKnowledge ? "buttonIndexing" : "buttonIndexMarkdown");
+  knowledgeProgressLabel.textContent = knowledgeProgressLabelRenderer();
+  const detailText = knowledgeProgressDetailRenderer();
+  knowledgeProgressFill.title = detailText;
+  knowledgeProgressLabel.setAttribute("title", detailText);
+  renderChatRoleLabels();
+  if (isOnboardingActive()) {
+    renderOnboardingStep(false);
+  }
+}
+
+function getTranslationKey(value: string | undefined): UiTranslationKey | null {
+  if (value && value in translations.ru) {
+    return value as UiTranslationKey;
+  }
+
+  return null;
+}
+
+function t(key: UiTranslationKey): string {
+  return translations[currentLanguage][key];
+}
+
+function formatTranslation(
+  key: UiTranslationKey,
+  params?: Record<string, string | number>
+): string {
+  const template = t(key);
+  if (!params) {
+    return template;
+  }
+
+  return template.replace(/\{(\w+)\}/g, (match, name: string) =>
+    params[name] !== undefined ? String(params[name]) : match
+  );
+}
+
+function createTextRenderer(
+  key: UiTranslationKey,
+  params?: Record<string, string | number>
+): TranslatedTextRenderer {
+  return () => formatTranslation(key, params);
+}
+
+function toTextRenderer(value: string | TranslatedTextRenderer): TranslatedTextRenderer {
+  return typeof value === "function" ? value : () => value;
+}
+
+function setPipelineHint(labelKey: UiTranslationKey): void {
+  pipelineHintRenderer = createTextRenderer(labelKey);
+  pipelineHint.textContent = pipelineHintRenderer();
+}
+
+function setPipelineHintRaw(value: string): void {
+  pipelineHintRenderer = () => value;
+  pipelineHint.textContent = value;
+}
+
+function setMicStatus(labelKey: UiTranslationKey): void {
+  micStatusKey = labelKey;
+  micStatus.textContent = t(labelKey);
+}
+
+function setWsStatus(labelKey: UiTranslationKey): void {
+  wsStatusKey = labelKey;
+  wsStatus.textContent = t(labelKey);
+}
+
+function setTriggerStatus(labelKey: UiTranslationKey): void {
+  triggerStatusKey = labelKey;
+  triggerStatus.textContent = t(labelKey);
+}
+
+function setProcessingStatus(labelKey: UiTranslationKey): void {
+  processingStatusKey = labelKey;
+  processingStatus.textContent = t(labelKey);
+}
+
+function setLatencySlot(
+  slot: LatencySlot,
+  value?: number,
+  fallbackKey: UiTranslationKey = "statusPending"
+): void {
+  latencyState = {
+    ...latencyState,
+    [slot]: {
+      value,
+      fallbackKey
+    }
+  };
+  renderLatencySlot(slot);
+}
+
+function renderLatencySlots(): void {
+  (Object.keys(latencySlots) as LatencySlot[]).forEach((slot) => {
+    renderLatencySlot(slot);
+  });
+}
+
+function renderLatencySlot(slot: LatencySlot): void {
+  const state = latencyState[slot];
+  latencySlots[slot].textContent = state.value !== undefined ? `${state.value} ms` : t(state.fallbackKey);
+}
+
+function getChatRoleLabel(role: "user" | "assistant"): string {
+  return t(role === "user" ? "chatRoleUser" : "chatRoleAssistant");
+}
+
+function renderChatRoleLabels(): void {
+  document.querySelectorAll<HTMLElement>("[data-chat-role]").forEach((bubble) => {
+    const role = bubble.dataset.chatRole;
+    if (role !== "user" && role !== "assistant") {
+      return;
+    }
+
+    const label = bubble.querySelector<HTMLElement>("[data-chat-role-label]");
+    if (label) {
+      label.textContent = getChatRoleLabel(role);
+    }
+  });
+}
+
+function shouldStartOnboardingTour(): boolean {
+  try {
+    return window.localStorage.getItem(ONBOARDING_STORAGE_KEY) !== "true";
+  } catch {
+    return true;
+  }
+}
+
+function startOnboardingTour(): void {
+  clearOnboardingHighlight();
+  activeOnboardingStepIndex = 0;
+  onboardingBackdrop.hidden = false;
+  onboardingTooltip.hidden = false;
+  document.body.classList.add("onboarding-active");
+  renderOnboardingStep(true);
+}
+
+function advanceOnboardingTour(): void {
+  if (!isOnboardingActive()) {
+    return;
+  }
+
+  if (activeOnboardingStepIndex >= ONBOARDING_STEPS.length - 1) {
+    completeOnboardingTour();
+    return;
+  }
+
+  activeOnboardingStepIndex += 1;
+  renderOnboardingStep(true);
+}
+
+function completeOnboardingTour(): void {
+  try {
+    window.localStorage.setItem(ONBOARDING_STORAGE_KEY, "true");
+  } catch {
+    // Completion persistence is best-effort, matching language persistence.
+  }
+
+  clearOnboardingHighlight();
+  activeOnboardingStepIndex = -1;
+  onboardingBackdrop.hidden = true;
+  onboardingTooltip.hidden = true;
+  document.body.classList.remove("onboarding-active");
+}
+
+function isOnboardingActive(): boolean {
+  return activeOnboardingStepIndex >= 0;
+}
+
+function renderOnboardingStep(shouldScroll: boolean): void {
+  const step = ONBOARDING_STEPS[activeOnboardingStepIndex];
+  if (!step) {
+    completeOnboardingTour();
+    return;
+  }
+
+  const target = document.querySelector<HTMLElement>(step.targetSelector);
+  if (!target) {
+    advanceOnboardingTour();
+    return;
+  }
+
+  clearOnboardingHighlight();
+  activeOnboardingTarget = target;
+  activeOnboardingTarget.classList.add("tour-highlight");
+
+  onboardingProgress.textContent = formatTranslation("onboardingProgress", {
+    current: activeOnboardingStepIndex + 1,
+    total: ONBOARDING_STEPS.length
+  });
+  onboardingTitle.textContent = t(step.titleKey);
+  onboardingBody.textContent = t(step.bodyKey);
+  onboardingSkipButton.textContent = t("onboardingSkip");
+  onboardingNextButton.textContent =
+    activeOnboardingStepIndex === ONBOARDING_STEPS.length - 1
+      ? t("onboardingDone")
+      : t("onboardingNext");
+
+  if (shouldScroll) {
+    target.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
+    window.setTimeout(positionOnboardingTooltip, 260);
+  }
+
+  positionOnboardingTooltip();
+}
+
+function clearOnboardingHighlight(): void {
+  activeOnboardingTarget?.classList.remove("tour-highlight");
+  activeOnboardingTarget = null;
+}
+
+function positionOnboardingTooltip(): void {
+  const step = ONBOARDING_STEPS[activeOnboardingStepIndex];
+  if (!step || !activeOnboardingTarget || onboardingTooltip.hidden) {
+    return;
+  }
+
+  if (window.matchMedia("(max-width: 640px)").matches) {
+    onboardingTooltip.removeAttribute("style");
+    return;
+  }
+
+  const gap = 16;
+  const margin = 16;
+  const targetRect = activeOnboardingTarget.getBoundingClientRect();
+  const tooltipRect = onboardingTooltip.getBoundingClientRect();
+  const placements = getPreferredPlacements(step.placement);
+  const coordinates = placements
+    .map((placement) => getTooltipCoordinates(placement, targetRect, tooltipRect, gap))
+    .find((candidate) =>
+      candidate.left >= margin &&
+      candidate.top >= margin &&
+      candidate.left + tooltipRect.width <= window.innerWidth - margin &&
+      candidate.top + tooltipRect.height <= window.innerHeight - margin
+    );
+
+  const fallback = coordinates ?? {
+    left: clamp((window.innerWidth - tooltipRect.width) / 2, margin, window.innerWidth - tooltipRect.width - margin),
+    top: clamp(targetRect.bottom + gap, margin, window.innerHeight - tooltipRect.height - margin)
+  };
+
+  onboardingTooltip.style.left = `${Math.round(fallback.left)}px`;
+  onboardingTooltip.style.top = `${Math.round(fallback.top)}px`;
+  onboardingTooltip.style.right = "auto";
+  onboardingTooltip.style.bottom = "auto";
+}
+
+function getPreferredPlacements(preferred: TourPlacement): TourPlacement[] {
+  const fallbacks: TourPlacement[] = ["bottom", "top", "right", "left"];
+  return [preferred, ...fallbacks.filter((placement) => placement !== preferred)];
+}
+
+function getTooltipCoordinates(
+  placement: TourPlacement,
+  targetRect: DOMRect,
+  tooltipRect: DOMRect,
+  gap: number
+): { left: number; top: number } {
+  if (placement === "top") {
+    return {
+      left: targetRect.left + (targetRect.width - tooltipRect.width) / 2,
+      top: targetRect.top - tooltipRect.height - gap
+    };
+  }
+
+  if (placement === "right") {
+    return {
+      left: targetRect.right + gap,
+      top: targetRect.top + (targetRect.height - tooltipRect.height) / 2
+    };
+  }
+
+  if (placement === "left") {
+    return {
+      left: targetRect.left - tooltipRect.width - gap,
+      top: targetRect.top + (targetRect.height - tooltipRect.height) / 2
+    };
+  }
+
+  return {
+    left: targetRect.left + (targetRect.width - tooltipRect.width) / 2,
+    top: targetRect.bottom + gap
+  };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (max < min) {
+    return min;
+  }
+
+  return Math.min(Math.max(value, min), max);
+}
+
 function getRequiredElement<T extends HTMLElement>(selector: string): T {
   const element = document.querySelector<T>(selector);
 
@@ -1320,6 +1884,14 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+applyLanguage();
 startIdleWaveform();
 sendTextButton.disabled = false;
-updateKnowledgeUiState(false, knowledgeInput.value.trim() ? "shared / stale" : "empty");
+knowledgeSafetyConfirmation.checked = false;
+updateKnowledgeUiState(
+  false,
+  knowledgeInput.value.trim() ? createTextRenderer("statusSharedStale") : createTextRenderer("statusEmpty")
+);
+if (shouldStartOnboardingTour()) {
+  window.setTimeout(startOnboardingTour, 350);
+}
