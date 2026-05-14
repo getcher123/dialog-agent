@@ -239,6 +239,7 @@ let latencyState: Record<LatencySlot, { value?: number; fallbackKey: UiTranslati
 };
 let activeOnboardingStepIndex = -1;
 let activeOnboardingTarget: HTMLElement | null = null;
+let activeOnboardingScope: HTMLElement | null = null;
 
 languageButtons.forEach((button) => {
   button.addEventListener("click", () => {
@@ -1757,6 +1758,11 @@ function renderOnboardingStep(shouldScroll: boolean): void {
   clearOnboardingHighlight();
   activeOnboardingTarget = target;
   activeOnboardingTarget.classList.add("tour-highlight");
+  const targetCard = target.closest<HTMLElement>(".card");
+  if (targetCard && targetCard !== target) {
+    activeOnboardingScope = targetCard;
+    activeOnboardingScope.classList.add("tour-highlight-scope");
+  }
 
   onboardingProgress.textContent = formatTranslation("onboardingProgress", {
     current: activeOnboardingStepIndex + 1,
@@ -1780,7 +1786,9 @@ function renderOnboardingStep(shouldScroll: boolean): void {
 
 function clearOnboardingHighlight(): void {
   activeOnboardingTarget?.classList.remove("tour-highlight");
+  activeOnboardingScope?.classList.remove("tour-highlight-scope");
   activeOnboardingTarget = null;
+  activeOnboardingScope = null;
 }
 
 function positionOnboardingTooltip(): void {

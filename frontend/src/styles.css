@@ -559,6 +559,11 @@ body {
     0 18px 48px rgba(21, 33, 27, 0.22);
 }
 
+.tour-highlight-scope {
+  position: relative;
+  z-index: 70;
+}
+
 [hidden] {
   display: none !important;
 }
