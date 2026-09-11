@@ -15,6 +15,9 @@ betancourt/kb
 betancourt/reports
 betancourt/tests
 betancourt/DELIVERY.md
+betancourt/AGENTS.md
+betancourt/REVIEW.md
+betancourt/batches
 betancourt/flowise/private
 betancourt/flowise/storage
 betancourt/flowise/logs

@@ -6,7 +6,7 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const [service, output] = process.argv.slice(2);
 const files = {
   gateway: ['amvera.yaml', '.dockerignore', 'gateway/Dockerfile', 'gateway/chat.mjs', 'gateway/server.mjs', 'web/index.html', 'web/app.js', 'web/styles.css', 'web/config.js'],
-  flowise: ['Dockerfile', 'amvera.yaml', 'disable-retries.mjs'],
+  flowise: ['Dockerfile', '.dockerignore', 'amvera.yaml', 'disable-retries.mjs'],
 };
 if (!files[service] || !output) throw new Error('Usage: node tools/package-amvera.mjs gateway|flowise <new-empty-directory>');
 await mkdir(output); // Never reuse a directory that could contain private or stale files.
