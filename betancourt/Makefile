@@ -2,7 +2,7 @@ PYTHON ?= python3
 
 .PHONY: check index export-index up smoke
 check:
-	node --test tests/gateway.test.mjs
+	node --test tests/backend.test.mjs
 	node --test tests/rag.test.mjs
 	node --test tests/import-index.test.mjs
 	$(PYTHON) tools/validate_kb.py --source kb/source/extracted.txt
