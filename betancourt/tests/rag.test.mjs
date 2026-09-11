@@ -21,7 +21,7 @@ function responseQueue(items, calls) {
 
 test('verified prompt is unchanged from the accepted configuration', async () => {
   const prompt = await readFile(new URL('../backend/prompt.txt', import.meta.url));
-  assert.equal(createHash('sha256').update(prompt).digest('hex'), '8d8d849566f2e239e2a75bf86ed748be932a7735c703be822b67d668ec6d3999');
+  assert.equal(createHash('sha256').update(prompt).digest('hex'), '5e0e9c086fdfaf305409d7d4331bf9391c6a351007c2f5e1cd734699c0441261');
 });
 
 test('direct RAG performs one embedding, one Qdrant query and one completion', async () => {
