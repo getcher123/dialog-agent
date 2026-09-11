@@ -3,7 +3,8 @@ meta:
   toolchain:
     name: docker
 build:
-  dockerfile: gateway/Dockerfile
+  dockerfile: backend/Dockerfile
 run:
   containerPort: 3000
+  servicePort: 80
   persistenceMount: /data

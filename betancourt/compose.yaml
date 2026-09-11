@@ -9,43 +9,25 @@ services:
       QDRANT__TELEMETRY_DISABLED: 'true'
     ports:
       - '127.0.0.1:6333:6333'
-  flowise:
-    build: ./flowise
-    restart: unless-stopped
-    environment:
-      PORT: '3000'
-      DATABASE_PATH: /data
-      SECRETKEY_PATH: /data
-      BLOB_STORAGE_PATH: /data/storage
-      LOG_PATH: /data/logs
-      DISABLE_FLOWISE_TELEMETRY: 'true'
-      LOG_LEVEL: error
-      DEBUG: 'false'
-    volumes:
-      - flowise_data:/data
-    ports:
-      - '127.0.0.1:3301:3000'
-    depends_on:
-      - qdrant
-  gateway:
+  backend:
     build:
       context: .
-      dockerfile: gateway/Dockerfile
+      dockerfile: backend/Dockerfile
     restart: unless-stopped
     environment:
       HOST: 0.0.0.0
       PORT: '3000'
-      FLOWISE_URL: http://flowise:3000
-      FLOWISE_FLOW_ID: ${FLOWISE_FLOW_ID:-}
-      FLOWISE_API_KEY: ${FLOWISE_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-}
       PILOT_TOKEN: ${PILOT_TOKEN:-}
       CHAT_ENABLED: ${CHAT_ENABLED:-false}
-      PAGES_ORIGIN: ${PAGES_ORIGIN:-http://127.0.0.1:3310}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://127.0.0.1:3310}
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
     ports:
       - '127.0.0.1:3310:3000'
     depends_on:
-      - flowise
+      - qdrant
 volumes:
   qdrant_data:
-  flowise_data:

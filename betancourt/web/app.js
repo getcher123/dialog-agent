@@ -29,7 +29,7 @@ document.querySelector('#forget').addEventListener('click', () => {
   activeRequest = undefined;
   invitation.value = '';
   input.value = '';
-  messages.replaceChildren(element('p', 'Задайте новый полный вопрос.', 'empty'));
+  messages.replaceChildren();
   status.textContent = serviceUnavailable ? 'Публичный сервер ещё не подключён. Консультации пока недоступны.' : '';
   error.hidden = true;
   send.disabled = serviceUnavailable;
@@ -63,7 +63,6 @@ form.addEventListener('submit', async event => {
     if (!response.ok) throw new Error(body.error || 'Сервис временно недоступен.');
     if (typeof body.answer !== 'string' || !Array.isArray(body.sources)) throw new Error('Сервис вернул некорректный ответ.');
     if (ownGeneration !== generation) return;
-    messages.querySelector('.empty')?.remove();
     const article = element('article', undefined, 'exchange');
     article.append(element('p', 'Ваш вопрос', 'speaker'), element('p', question, 'question-text'), element('p', 'Консультант', 'speaker'), element('p', body.answer, 'answer'));
     const sources = element('details', undefined, 'sources');

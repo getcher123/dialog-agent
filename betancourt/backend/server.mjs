@@ -13,7 +13,7 @@ const assets = new Map([
 ]);
 const server = createServer(async (req, res) => {
   const path = req.url?.split('?')[0];
-  if ((path === '/' || path === '/betancourt') && req.method === 'GET') {
+  if ((path === '/' || path === '/betancourt') && ['GET', 'HEAD'].includes(req.method)) {
     res.writeHead(302, { Location: '/betancourt/' }); res.end(); return;
   }
   if (assets.has(path) && ['GET', 'HEAD'].includes(req.method)) {
@@ -32,7 +32,7 @@ const server = createServer(async (req, res) => {
 });
 server.requestTimeout = 65000;
 server.headersTimeout = 15000;
-server.listen(Number(process.env.PORT ?? 3310), process.env.HOST ?? '127.0.0.1', () => console.log('Betancourt gateway started'));
+server.listen(Number(process.env.PORT ?? 3310), process.env.HOST ?? '127.0.0.1', () => console.log('Betancourt backend started'));
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => {
   server.close(() => process.exit(0));
   setTimeout(() => { server.closeAllConnections(); process.exit(0); }, 65000).unref();

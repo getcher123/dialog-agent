@@ -1,51 +1,36 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { BlockList, isIP } from 'node:net';
+import { createRag, loadRagConfig } from './rag.mjs';
 
 const MAX_BODY = 8192;
-const NO_CONTEXT = 'В найденных фрагментах недостаточно данных для ответа. Уточните вопрос.';
 const sha = value => createHash('sha256').update(value).digest();
 
 export function loadConfig(env = process.env) {
+  const allowedOrigins = (env.ALLOWED_ORIGINS ?? 'https://getcher123.github.io')
+    .split(',').map(value => value.trim()).filter(Boolean);
+  if (!allowedOrigins.length || allowedOrigins.some(value => {
+    try {
+      const url = new URL(value);
+      return url.origin !== value || (url.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname));
+    } catch { return true; }
+  })) throw new Error('ALLOWED_ORIGINS must contain comma-separated HTTPS origins');
   const config = {
     enabled: env.CHAT_ENABLED === 'true',
     token: env.PILOT_TOKEN ?? '',
-    flowiseUrl: env.FLOWISE_URL ?? '',
-    flowId: env.FLOWISE_FLOW_ID ?? '',
-    flowiseKey: env.FLOWISE_API_KEY ?? '',
-    origin: env.PAGES_ORIGIN ?? 'https://getcher123.github.io',
+    allowedOrigins,
     trustedProxies: (env.TRUSTED_PROXY_CIDRS ?? '').split(',').map(v => v.trim()).filter(Boolean),
     timeoutMs: 60000,
   };
   if (config.enabled) {
-    if (config.token.length < 43 || !config.flowiseKey || config.token === config.flowiseKey || !/^[\w-]+$/.test(config.flowId)) {
-      throw new Error('Configure separate PILOT_TOKEN (32 random bytes), FLOWISE_API_KEY and FLOWISE_FLOW_ID before enabling chat');
+    if (!/^[A-Za-z0-9_-]{43,256}$/.test(config.token) || [env.OPENAI_API_KEY, env.QDRANT_API_KEY].includes(config.token)) {
+      throw new Error('Configure a separate PILOT_TOKEN generated from 32 random bytes before enabling chat');
     }
-    const url = new URL(config.flowiseUrl);
-    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('Invalid FLOWISE_URL');
+    config.rag = loadRagConfig(env);
   }
   return config;
 }
 
-export function sanitizePrediction(body) {
-  if (!body || typeof body.text !== 'string' || !body.text.trim() || body.text.length > 20000 || !Array.isArray(body.sourceDocuments)) {
-    throw new Error('Invalid prediction');
-  }
-  const sources = new Map();
-  if (body.sourceDocuments.length > 8) throw new Error('Unexpected retrieval size');
-  for (const doc of body.sourceDocuments) {
-    const id = doc?.metadata?.chunk_id;
-    const section = doc?.metadata?.section;
-    const excerpt = doc?.pageContent;
-    if (typeof id !== 'string' || !/^[a-z][a-z0-9_]{2,79}$/.test(id) || typeof section !== 'string' || !section.trim() || section.length > 1000 ||
-        typeof excerpt !== 'string' || !excerpt.trim() || excerpt.length > 8000) throw new Error('Invalid source document');
-    const source = { id, section, excerpt };
-    if (sources.has(id) && JSON.stringify(sources.get(id)) !== JSON.stringify(source)) throw new Error('Conflicting source document');
-    sources.set(id, source);
-  }
-  return { answer: sources.size ? body.text : NO_CONTEXT, sources: [...sources.values()] };
-}
-
-export function createChatHandler(config, { fetchImpl = fetch, now = Date.now, log = record => console.log(JSON.stringify(record)) } = {}) {
+export function createChatHandler(config, { answerQuestion = createRag(config.rag), now = Date.now, log = record => console.log(JSON.stringify(record)) } = {}) {
   const trusted = new BlockList();
   for (const cidr of config.trustedProxies) {
     const [address, prefix] = cidr.split('/');
@@ -68,6 +53,7 @@ export function createChatHandler(config, { fetchImpl = fetch, now = Date.now, l
   }
   let globalRequests = [];
   const perIp = new Map();
+  const failedAuthByIp = new Map();
   let active = 0;
   return async function handle(req, res) {
     const path = req.url?.split('?')[0];
@@ -77,28 +63,34 @@ export function createChatHandler(config, { fetchImpl = fetch, now = Date.now, l
       if (res.destroyed || res.writableEnded) return;
       res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff', 'X-Request-Id': requestId, ...extra });
-      res.end(JSON.stringify(body));
+      res.end(req.method === 'HEAD' ? undefined : JSON.stringify(body));
     }
     res.setHeader('Vary', 'Origin');
     const origin = req.headers.origin;
-    if (origin && origin !== config.origin) return reply(403, { error: 'Этот сайт не имеет доступа к API.' });
+    if (origin && !config.allowedOrigins.includes(origin)) return reply(403, { error: 'Этот сайт не имеет доступа к API.' });
     if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
-    if (path === '/healthz' && req.method === 'GET') return reply(200, { ok: true, service: 'betancourt-gateway', chatEnabled: config.enabled });
+    if (path === '/healthz' && ['GET', 'HEAD'].includes(req.method)) return reply(200, { ok: true, service: 'betancourt-backend', chatEnabled: config.enabled });
     if (path !== '/api/chat') return reply(404, { error: 'Маршрут не найден.' });
     if (req.method === 'OPTIONS') return reply(204, {}, { 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'Authorization, Content-Type' });
     if (req.method !== 'POST') return reply(405, { error: 'Используйте POST.' }, { Allow: 'POST' });
     if (!config.enabled) return reply(503, { error: 'Чат временно отключён.' });
+    const timestamp = now();
+    const ip = clientIp(req);
+    const authAttempts = (failedAuthByIp.get(ip) ?? []).filter(t => timestamp - t < 60000);
+    failedAuthByIp.set(ip, authAttempts);
     const supplied = req.headers.authorization ?? '';
-    if (!timingSafeEqual(sha(supplied), sha(`Bearer ${config.token}`))) return reply(401, { error: 'Введите действующий код приглашения.' });
+    if (!timingSafeEqual(sha(supplied), sha(`Bearer ${config.token}`))) {
+      if (authAttempts.length >= 5) return reply(429, { error: 'Слишком много неверных кодов. Попробуйте через минуту.' }, { 'Retry-After': '60' });
+      authAttempts.push(timestamp);
+      return reply(401, { error: 'Введите действующий код приглашения.' });
+    }
     if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '')) return reply(415, { error: 'Требуется application/json.' });
     if (Number(req.headers['content-length']) > MAX_BODY) return reply(413, { error: 'Сообщение слишком большое.' });
-    const timestamp = now();
     globalRequests = globalRequests.filter(t => timestamp - t < 60000);
     for (const [ip, entries] of perIp) {
       const live = entries.filter(t => timestamp - t < 60000);
       if (live.length) perIp.set(ip, live); else perIp.delete(ip);
     }
-    const ip = clientIp(req);
     const attempts = perIp.get(ip) ?? [];
     if (globalRequests.length >= 30 || attempts.length >= 5) return reply(429, { error: 'Слишком много запросов. Попробуйте через минуту.' }, { 'Retry-After': '60' });
     if (active >= 2) return reply(429, { error: 'Сейчас обрабатываются другие вопросы. Попробуйте чуть позже.' }, { 'Retry-After': '5' });
@@ -125,18 +117,16 @@ export function createChatHandler(config, { fetchImpl = fetch, now = Date.now, l
         return reply(400, { error: 'Передайте только message: непустой вопрос до 2000 символов.' });
       }
       result = 'upstream_error';
-      const upstream = await fetchImpl(`${config.flowiseUrl.replace(/\/$/, '')}/api/v1/prediction/${encodeURIComponent(config.flowId)}`, {
-        method: 'POST', headers: { Authorization: `Bearer ${config.flowiseKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: body.message.trim(), streaming: false }), signal: controller.signal,
-      });
-      if (!upstream.ok) return reply(502, { error: 'Сервис ответа временно недоступен. Попробуйте позже.' });
-      const response = sanitizePrediction(await upstream.json());
+      const response = await answerQuestion(body.message.trim(), { signal: controller.signal });
       result = 'ok';
       reply(200, response);
     } catch (error) {
       if (controller.signal.aborted) { result = 'timeout_or_cancelled'; reply(504, { error: 'Сервис не успел ответить. Попробуйте позже.' }); }
       else if (error.message === 'invalid_json') reply(400, { error: 'Некорректный JSON.' });
-      else reply(502, { error: 'Сервис ответа временно недоступен. Попробуйте позже.' });
+      else {
+        if (error.providerStage) result = `provider_${error.providerStage}_${error.providerStatus ?? 'error'}`;
+        reply(502, { error: 'Сервис ответа временно недоступен. Попробуйте позже.' });
+      }
     } finally {
       clearTimeout(timer);
       res.removeListener('close', onClose);

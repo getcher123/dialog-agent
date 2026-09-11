@@ -1,4 +1,4 @@
-name: Check Betancourt Gateway
+name: Check Betancourt Backend
 on:
   push:
     branches: [feature/betancourt]
@@ -15,4 +15,6 @@ jobs:
         with:
           node-version: '24'
       - run: node --test betancourt/tests/gateway.test.mjs
+      - run: node --test betancourt/tests/rag.test.mjs
+      - run: node --test betancourt/tests/import-index.test.mjs
       - run: node betancourt/tools/build-pages.mjs /tmp/betancourt-public

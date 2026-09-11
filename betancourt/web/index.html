@@ -11,21 +11,19 @@
 </head>
 <body>
   <main>
-    <header><span class="eyebrow">Закрытый пилот / Консультант по документу</span><h1>Бетанкур<span class="dot">.</span></h1><p class="intro">Спросите о доме.<br>Посмотрите, на чём основан ответ.</p></header>
+    <header><span class="eyebrow">Консультант по документу</span><h1>Бетанкур<span class="dot">.</span></h1><p class="intro">Спросите о доме.<br>Посмотрите, на чём основан ответ.</p></header>
     <div class="workspace">
       <aside>
-        <section class="access"><h2>Доступ к консультации</h2><label for="invitation">Код приглашения</label><input id="invitation" type="password" autocomplete="off" spellcheck="false" placeholder="Введите код"><p class="small">Код хранится только до закрытия вкладки.</p><button id="forget" type="button" class="subtle">Забыть код и очистить диалог</button></section>
-        <section class="notice"><h2>Как задавать вопросы</h2><p>Ответы по предоставленному документу. Актуальность не подтверждена.</p><p>Каждый вопрос задавайте полностью: предыдущие сообщения не учитываются.</p><p>Полные справочники инфраструктуры не подключены.</p></section>
+        <section class="access"><h2>Доступ к консультации</h2><label for="invitation">Код приглашения</label><input id="invitation" type="password" autocomplete="off" spellcheck="false" placeholder="Введите код"><button id="forget" type="button" class="subtle">Забыть код и очистить диалог</button></section>
       </aside>
       <section class="conversation" aria-label="Вопросы и ответы">
-        <div class="conversation-heading"><h2>Вопросы о доме</h2><span>Без памяти диалога</span></div>
-        <div id="messages" aria-live="polite" aria-relevant="additions"><p id="empty" class="empty">Начните с полного вопроса: укажите тип помещения и то, что хотите узнать.</p></div>
+        <div class="conversation-heading"><h2>Вопросы о доме</h2></div>
+        <div id="messages" aria-live="polite" aria-relevant="additions"></div>
         <form id="question-form"><label for="question">Ваш вопрос</label><textarea id="question" rows="3" maxlength="2000" required placeholder="Какие окна предусмотрены в квартирах и коммерческих помещениях?"></textarea><div class="composer-footer"><span id="count">0 / 2000</span><button id="send" type="submit">Задать вопрос <span aria-hidden="true">↗</span></button></div></form>
         <p id="status" role="status"></p>
         <p id="error" role="alert" hidden></p>
       </section>
     </div>
-    <footer>Найденные фрагменты показывают результаты поиска. Они не гарантируют, что каждое предложение ответа подтверждено документом.</footer>
   </main>
 </body>
 </html>
