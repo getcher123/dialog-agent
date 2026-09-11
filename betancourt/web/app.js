@@ -6,6 +6,7 @@ const messages = document.querySelector('#messages');
 const send = document.querySelector('#send');
 const status = document.querySelector('#status');
 const error = document.querySelector('#error');
+const suggestions = document.querySelectorAll('[data-question]');
 const serviceUnavailable = !window.BETANCOURT_CONFIG?.apiBase && location.hostname.endsWith('github.io');
 if (serviceUnavailable) {
   status.textContent = 'Публичный сервер ещё не подключён. Консультации пока недоступны.';
@@ -23,6 +24,14 @@ function element(tag, text, className) {
 }
 
 input.addEventListener('input', () => { document.querySelector('#count').textContent = `${input.value.length} / 2000`; });
+for (const suggestion of suggestions) {
+  suggestion.addEventListener('click', () => {
+    input.value = suggestion.dataset.question;
+    input.dispatchEvent(new Event('input'));
+    error.hidden = true;
+    input.focus();
+  });
+}
 document.querySelector('#forget').addEventListener('click', () => {
   generation++;
   activeRequest?.abort();

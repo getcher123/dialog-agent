@@ -19,7 +19,7 @@
       <section class="conversation" aria-label="Вопросы и ответы">
         <div class="conversation-heading"><h2>Вопросы о доме</h2></div>
         <div id="messages" aria-live="polite" aria-relevant="additions"></div>
-        <form id="question-form"><label for="question">Ваш вопрос</label><textarea id="question" rows="3" maxlength="2000" required placeholder="Какие окна предусмотрены в квартирах и коммерческих помещениях?"></textarea><div class="composer-footer"><span id="count">0 / 2000</span><button id="send" type="submit">Задать вопрос <span aria-hidden="true">↗</span></button></div></form>
+        <form id="question-form"><label for="question">Ваш вопрос</label><textarea id="question" rows="3" maxlength="2000" required placeholder="Какие окна предусмотрены в квартирах и коммерческих помещениях?"></textarea><div class="question-suggestions" aria-label="Примеры вопросов"><button type="button" data-question="Сколько квартир, секций и надземных этажей?">Сколько квартир, секций и этажей?</button><button type="button" data-question="Как очищается вода в квартирах?">Как очищается вода в квартирах?</button><button type="button" data-question="Сравни окна квартиры и коммерческого помещения">Чем отличаются окна?</button><button type="button" data-question="В квартире уже установлены кондиционер и рекуперация?">Что уже установлено в квартире?</button></div><div class="composer-footer"><span id="count">0 / 2000</span><button id="send" type="submit">Задать вопрос <span aria-hidden="true">↗</span></button></div></form>
         <p id="status" role="status"></p>
         <p id="error" role="alert" hidden></p>
       </section>
