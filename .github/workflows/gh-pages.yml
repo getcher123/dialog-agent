@@ -2,7 +2,7 @@ name: Deploy Frontend to GitHub Pages
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "feature/betancourt"]
   workflow_dispatch:
 
 permissions:
@@ -15,10 +15,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: "20"
+  NODE_VERSION: "24"
   PAGES_ARTIFACT_NAME: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
   VITE_BASE: "/dialog-agent/"
   VITE_BACKEND_ORIGIN: ${{ vars.VITE_BACKEND_ORIGIN }}
+  BETANCOURT_API_BASE: ${{ vars.BETANCOURT_API_BASE }}
 
 jobs:
   deploy:
@@ -28,6 +29,15 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Checkout isolated Betancourt frontend
+        uses: actions/checkout@v4
+        with:
+          ref: feature/betancourt
+          path: variant
+          sparse-checkout: betancourt
 
       - uses: actions/setup-node@v4
         with:
@@ -38,6 +48,9 @@ jobs:
 
       - name: Build frontend
         run: npm run build --workspace frontend
+
+      - name: Add Betancourt route without replacing the main frontend
+        run: node variant/betancourt/tools/build-pages.mjs frontend/dist/betancourt
 
       - name: Disable Jekyll
         run: touch frontend/dist/.nojekyll
