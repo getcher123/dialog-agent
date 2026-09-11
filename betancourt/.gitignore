@@ -1,0 +1,16 @@
+# Полная KB, оригинал и извлечение остаются локальными до явного решения владельца.
+/kb/
+/reports/
+# Предметный проверочный набор также содержит сведения исходника.
+/tests/questions.jsonl
+/tests/test_kb.py
+/DELIVERY.md
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+/flowise/storage/
+/flowise/logs/

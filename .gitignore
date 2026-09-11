@@ -11,3 +11,19 @@ npm-debug.log*
 frontend/dist/
 backend/dist/
 docs/validation/artifacts/
+
+# Private Betancourt source material and local runtime state.
+betancourt/kb/
+betancourt/reports/
+betancourt/tests/questions.jsonl
+betancourt/tests/test_kb.py
+betancourt/DELIVERY.md
+betancourt/AGENTS.md
+betancourt/REVIEW.md
+betancourt/batches/
+betancourt/.venv/
+betancourt/flowise/storage/
+betancourt/flowise/logs/
+betancourt/flowise/private/
+**/__pycache__/
+*.pyc

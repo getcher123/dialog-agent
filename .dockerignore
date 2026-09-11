@@ -9,3 +9,13 @@ shared/node_modules
 .qdrant
 docs/validation/artifacts
 npm-debug.log*
+**/.env
+**/.env.local
+betancourt/kb
+betancourt/reports
+betancourt/tests
+betancourt/DELIVERY.md
+betancourt/flowise/private
+betancourt/flowise/storage
+betancourt/flowise/logs
+betancourt/.venv

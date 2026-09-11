@@ -1,0 +1,5 @@
+*
+!gateway/
+!gateway/**
+!web/
+!web/**
