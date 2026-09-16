@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const [service, output] = process.argv.slice(2);
 const files = {
-  backend: ['amvera.yaml', '.dockerignore', 'backend/Dockerfile', 'backend/chat.mjs', 'backend/rag.mjs', 'backend/import-index.mjs', 'backend/prompt.txt', 'backend/server.mjs', 'web/index.html', 'web/app.js', 'web/styles.css', 'web/config.js'],
+  backend: ['amvera.yaml', '.dockerignore', 'backend/Dockerfile', 'backend/backup-qdrant.mjs', 'backend/chat.mjs', 'backend/rag.mjs', 'backend/import-index.mjs', 'backend/prompt.txt', 'backend/server.mjs', 'web/index.html', 'web/app.js', 'web/styles.css', 'web/config.js'],
 };
 if (!files[service] || !output) throw new Error('Usage: node tools/package-amvera.mjs backend <new-empty-directory>');
 await mkdir(output); // Never reuse a directory that could contain private or stale files.

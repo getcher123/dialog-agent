@@ -9,6 +9,7 @@ check:
 	node --test tests/backend.test.mjs
 	node --test tests/rag.test.mjs
 	node --test tests/import-index.test.mjs
+	node --test tests/backup-qdrant.test.mjs
 	$(PYTHON) tools/validate_kb.py --source kb/source/extracted.txt
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 
