@@ -71,6 +71,22 @@ export async function loadIndexFile(file, expected = process.env) {
   return { resolved, archiveSha, manifest, points };
 }
 
+export async function verifyBackupFile(file, expected = process.env) {
+  if (!file) throw new Error('QDRANT_BACKUP_FILE is required');
+  const dataRoot = await realpath(expected.INDEX_DATA_DIR ?? '/data');
+  const resolved = await realpath(file);
+  if (resolved !== dataRoot && !resolved.startsWith(`${dataRoot}${path.sep}`)) throw new Error('Backup file must be inside INDEX_DATA_DIR');
+  const bytes = await readFile(resolved);
+  if (bytes.length > 64 * 1024 * 1024) throw new Error('Qdrant backup exceeds 64 MiB');
+  const backup = JSON.parse(bytes);
+  if (backup?.format !== 'betancourt-qdrant-backup-v1' || !Array.isArray(backup.collections) ||
+      !Number.isSafeInteger(backup.totalPoints) || backup.totalPoints < 0 ||
+      backup.collections.some(collection => typeof collection?.name !== 'string' || !Array.isArray(collection.points))) {
+    throw new Error('Invalid Qdrant backup');
+  }
+  return { resolved, sha256: createHash('sha256').update(bytes).digest('hex'), collections: backup.collections.length, points: backup.totalPoints };
+}
+
 function sameVector(left, right) {
   return Array.isArray(right) && left.length === right.length && left.every((value, index) => Math.abs(value - right[index]) <= 1e-6);
 }
@@ -128,10 +144,11 @@ export async function importIndex(index, config, fetchImpl = fetch) {
 async function main() {
   const file = process.env.INDEX_FILE;
   if (!file) throw new Error('INDEX_FILE is required');
+  const backup = await verifyBackupFile(process.env.QDRANT_BACKUP_FILE);
   const index = await loadIndexFile(file);
   const result = await importIndex(index, { qdrantUrl: process.env.QDRANT_URL ?? '', qdrantKey: process.env.QDRANT_API_KEY ?? '' });
   if (process.env.DELETE_INDEX_AFTER_IMPORT === 'true') await unlink(index.resolved);
-  console.log(JSON.stringify({ event: 'index_import_complete', ...result, cardsSha256: index.manifest.cards_sha256, archiveSha256: index.archiveSha }));
+  console.log(JSON.stringify({ event: 'index_import_complete', ...result, cardsSha256: index.manifest.cards_sha256, archiveSha256: index.archiveSha, backupSha256: backup.sha256, backupCollections: backup.collections, backupPoints: backup.points }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(error => {

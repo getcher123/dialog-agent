@@ -65,12 +65,13 @@ INDEX_CARDS_SHA256=<cards-sha256> \
 INDEX_COLLECTION=<versioned-collection-name> \
 INDEX_POINTS=<card-count> \
 INDEX_ARCHIVE_SHA256=<archive-sha256> \
+QDRANT_BACKUP_FILE=/data/<fresh-qdrant-backup>.json \
 QDRANT_URL=http://<internal-qdrant-host>:6333 \
 DELETE_INDEX_AFTER_IMPORT=true \
 node backend/import-index.mjs
 ```
 
-Импорт принимает только ожидаемый manifest v2, точные SHA карточек и архива, имя коллекции, динамическое число уникальных UUID/`chunk_id`, векторы 1536 и metadata. Совпадающая коллекция даёт `skipped:true`; частичная, конфликтующая или несовместимая коллекция не перезаписывается. После успешного импорта временный файл удаляется. Штатный запуск `backend/server.mjs` импорт не выполняет.
+Импорт сначала проверяет свежий backup Qdrant из приватного `/data`, затем принимает только ожидаемый manifest v2, точные SHA карточек и архива, имя коллекции, динамическое число уникальных UUID/`chunk_id`, векторы 1536 и metadata. Совпадающая коллекция даёт `skipped:true`; частичная, конфликтующая или несовместимая коллекция не перезаписывается. После успешного импорта временный файл удаляется. Штатный запуск `backend/server.mjs` импорт не выполняет.
 
 ## Amvera Waw0
 

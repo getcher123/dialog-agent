@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { DIMENSIONS } from '../backend/rag.mjs';
-import { importIndex, loadIndexFile } from '../backend/import-index.mjs';
+import { importIndex, loadIndexFile, verifyBackupFile } from '../backend/import-index.mjs';
 
 async function indexFixture(t, count = 101) {
   const directory = await mkdtemp(path.join(tmpdir(), 'betancourt-index-test-'));
@@ -46,6 +46,16 @@ test('private index loader rejects a damaged vector before any Qdrant call', asy
   await writeFile(fixture.file, bytes);
   await assert.rejects(() => loadIndexFile(fixture.file, { ...fixture.environment,
     INDEX_ARCHIVE_SHA256: createHash('sha256').update(bytes).digest('hex') }), /Invalid index point/);
+});
+
+test('import requires a valid Qdrant backup inside the private data directory', async t => {
+  const fixture = await indexFixture(t, 1);
+  const backupPath = path.join(fixture.directory, 'qdrant-backup.json');
+  await writeFile(backupPath, JSON.stringify({ format: 'betancourt-qdrant-backup-v1', collections: [{ name: 'legacy', points: [] }], totalPoints: 0 }));
+  const backup = await verifyBackupFile(backupPath, fixture.environment);
+  assert.equal(backup.collections, 1);
+  await writeFile(backupPath, JSON.stringify({ format: 'wrong', collections: [], totalPoints: 0 }));
+  await assert.rejects(() => verifyBackupFile(backupPath, fixture.environment), /Invalid Qdrant backup/);
 });
 
 test('matching multi-page collection is skipped and conflicting collection is never overwritten', async t => {
