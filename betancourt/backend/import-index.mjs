@@ -4,12 +4,21 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DIMENSIONS } from './rag.mjs';
 
-const FORMAT = 'betancourt-qdrant-export-v1';
+const FORMAT = 'betancourt-qdrant-export-v2';
 const COLLECTION_RE = /^betancourt_[a-f0-9]{16}_[a-f0-9]{8}$/;
 const SHA_RE = /^[a-f0-9]{64}$/;
 const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const SCOPES = new Set(['residential', 'commercial', 'parking', 'common', 'comparison']);
 const STATUSES = new Set(['source_only', 'preliminary', 'planned', 'conflict', 'missing']);
+const MAX_INDEX_POINTS = 5000;
+
+function expectedPointCount(value) {
+  const count = Number(value);
+  if (!Number.isSafeInteger(count) || count < 1 || count > MAX_INDEX_POINTS) {
+    throw new Error(`INDEX_POINTS must be an integer from 1 to ${MAX_INDEX_POINTS}`);
+  }
+  return count;
+}
 
 function assertPayload(payload) {
   if (!payload || Object.keys(payload).sort().join(',') !== 'content,metadata' || typeof payload.content !== 'string' || !payload.content.trim()) {
@@ -31,14 +40,22 @@ export async function loadIndexFile(file, expected = process.env) {
   const bytes = await readFile(resolved);
   if (bytes.length > 32 * 1024 * 1024) throw new Error('Index file exceeds 32 MiB');
   const archiveSha = createHash('sha256').update(bytes).digest('hex');
-  if (!SHA_RE.test(expected.INDEX_ARCHIVE_SHA256 ?? '') || archiveSha !== expected.INDEX_ARCHIVE_SHA256) throw new Error('Index archive SHA-256 mismatch');
+  if (!SHA_RE.test(expected.INDEX_ARCHIVE_SHA256 ?? '') || archiveSha !== expected.INDEX_ARCHIVE_SHA256) {
+    throw new Error('Index archive SHA-256 mismatch');
+  }
+  if (!SHA_RE.test(expected.INDEX_CARDS_SHA256 ?? '')) throw new Error('INDEX_CARDS_SHA256 must be a SHA-256 digest');
+  if (!COLLECTION_RE.test(expected.INDEX_COLLECTION ?? '')) throw new Error('INDEX_COLLECTION is invalid');
+  const pointsExpected = expectedPointCount(expected.INDEX_POINTS);
+
   const lines = bytes.toString('utf8').trimEnd().split('\n');
   const manifest = JSON.parse(lines.shift() ?? 'null');
-  if (!manifest || manifest.format !== FORMAT || !COLLECTION_RE.test(manifest.collection) || manifest.model !== 'text-embedding-3-small' ||
-      manifest.dimensions !== DIMENSIONS || manifest.distance !== 'Cosine' || manifest.points !== 87 ||
-      !SHA_RE.test(manifest.source_sha256) || manifest.source_sha256 !== expected.INDEX_SOURCE_SHA256 || lines.length !== manifest.points) {
+  if (!manifest || manifest.format !== FORMAT || manifest.cards_sha256 !== expected.INDEX_CARDS_SHA256 ||
+      manifest.collection !== expected.INDEX_COLLECTION || manifest.model !== 'text-embedding-3-small' ||
+      manifest.dimensions !== DIMENSIONS || manifest.distance !== 'Cosine' || manifest.points !== pointsExpected ||
+      !SHA_RE.test(manifest.cards_sha256) || lines.length !== manifest.points) {
     throw new Error('Invalid index manifest');
   }
+
   const ids = new Set();
   const chunkIds = new Set();
   const points = lines.map(line => {
@@ -47,7 +64,8 @@ export async function loadIndexFile(file, expected = process.env) {
         !Array.isArray(point.vector) || point.vector.length !== DIMENSIONS || !point.vector.every(Number.isFinite)) throw new Error('Invalid index point');
     assertPayload(point.payload);
     if (chunkIds.has(point.payload.metadata.chunk_id)) throw new Error('Duplicate chunk_id');
-    ids.add(point.id); chunkIds.add(point.payload.metadata.chunk_id);
+    ids.add(point.id);
+    chunkIds.add(point.payload.metadata.chunk_id);
     return point;
   });
   return { resolved, archiveSha, manifest, points };
@@ -71,11 +89,16 @@ export async function importIndex(index, config, fetchImpl = fetch) {
   const current = await request(collectionUrl);
   if (current.response.ok) {
     const vectors = current.body?.result?.config?.params?.vectors;
-    if (vectors?.size !== DIMENSIONS || String(vectors?.distance).toLowerCase() !== 'cosine') throw new Error('Existing collection has incompatible vector configuration');
+    if (vectors?.size !== DIMENSIONS || String(vectors?.distance).toLowerCase() !== 'cosine') {
+      throw new Error('Existing collection has incompatible vector configuration');
+    }
     const existing = [];
     let offset = null;
     do {
-      const page = await request(`${collectionUrl}/points/scroll`, { method: 'POST', body: JSON.stringify({ limit: 100, offset, with_payload: true, with_vector: true }) });
+      const page = await request(`${collectionUrl}/points/scroll`, {
+        method: 'POST',
+        body: JSON.stringify({ limit: 100, offset, with_payload: true, with_vector: true }),
+      });
       if (!page.response.ok || !Array.isArray(page.body?.result?.points)) throw new Error('Failed to verify existing collection');
       existing.push(...page.body.result.points);
       offset = page.body.result.next_page_offset ?? null;
@@ -88,10 +111,14 @@ export async function importIndex(index, config, fetchImpl = fetch) {
     return { collection: index.manifest.collection, points: existing.length, skipped: true };
   }
   if (current.response.status !== 404) throw new Error(`Qdrant collection check failed: HTTP ${current.response.status}`);
+
   const created = await request(collectionUrl, { method: 'PUT', body: JSON.stringify({ vectors: { size: DIMENSIONS, distance: 'Cosine' } }) });
   if (!created.response.ok) throw new Error(`Qdrant collection creation failed: HTTP ${created.response.status}`);
   for (let start = 0; start < index.points.length; start += 32) {
-    const uploaded = await request(`${collectionUrl}/points?wait=true`, { method: 'PUT', body: JSON.stringify({ points: index.points.slice(start, start + 32) }) });
+    const uploaded = await request(`${collectionUrl}/points?wait=true`, {
+      method: 'PUT',
+      body: JSON.stringify({ points: index.points.slice(start, start + 32) }),
+    });
     if (!uploaded.response.ok) throw new Error(`Qdrant point upload failed: HTTP ${uploaded.response.status}`);
   }
   const verified = await importIndex(index, config, fetchImpl);
@@ -104,7 +131,7 @@ async function main() {
   const index = await loadIndexFile(file);
   const result = await importIndex(index, { qdrantUrl: process.env.QDRANT_URL ?? '', qdrantKey: process.env.QDRANT_API_KEY ?? '' });
   if (process.env.DELETE_INDEX_AFTER_IMPORT === 'true') await unlink(index.resolved);
-  console.log(JSON.stringify({ event: 'index_import_complete', ...result, sourceSha256: index.manifest.source_sha256, archiveSha256: index.archiveSha }));
+  console.log(JSON.stringify({ event: 'index_import_complete', ...result, cardsSha256: index.manifest.cards_sha256, archiveSha256: index.archiveSha }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(error => {

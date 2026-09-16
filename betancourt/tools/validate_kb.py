@@ -89,8 +89,6 @@ def validate(cards: list[dict], source_text: str | None = None) -> list[str]:
                 for part in ref.split(' → '):
                     if normalize(part) not in source:
                         errors.append(f'{context}: в извлечении не найден ориентир {part!r}.')
-        if not content.startswith('Дом «Бетанкур». '):
-            errors.append(f'{context}: в начале content нет объекта.')
         serialized = json.dumps(c, ensure_ascii=False)
         if SERVICE_PATH.search(serialized):
             errors.append(f'{context}: найден служебный путь.')

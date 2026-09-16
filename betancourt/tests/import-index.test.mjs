@@ -7,50 +7,87 @@ import { test } from 'node:test';
 import { DIMENSIONS } from '../backend/rag.mjs';
 import { importIndex, loadIndexFile } from '../backend/import-index.mjs';
 
-async function indexFixture(t) {
+async function indexFixture(t, count = 101) {
   const directory = await mkdtemp(path.join(tmpdir(), 'betancourt-index-test-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const points = Array.from({ length: 87 }, (_, index) => ({ id: randomUUID(), vector: Array(DIMENSIONS).fill(index / 1000), payload: {
+  const points = Array.from({ length: count }, (_, index) => ({ id: randomUUID(), vector: Array(DIMENSIONS).fill(index / 1000), payload: {
     content: `Карточка ${index}`,
     metadata: { chunk_id: `fixture_${index}`, section: 'Раздел', scope: 'common', source_status: 'source_only', source_refs: ['Источник'] },
   } }));
-  const sourceSha = 'a'.repeat(64);
-  const manifest = { format: 'betancourt-qdrant-export-v1', source_sha256: sourceSha,
-    collection: 'betancourt_0123456789abcdef_01234567', model: 'text-embedding-3-small', dimensions: DIMENSIONS,
-    distance: 'Cosine', points: 87 };
+  const cardsSha = 'a'.repeat(64);
+  const collection = 'betancourt_0123456789abcdef_01234567';
+  const manifest = { format: 'betancourt-qdrant-export-v2', cards_sha256: cardsSha, collection,
+    model: 'text-embedding-3-small', dimensions: DIMENSIONS, distance: 'Cosine', points: count };
   const bytes = Buffer.from([JSON.stringify(manifest), ...points.map(point => JSON.stringify(point))].join('\n') + '\n');
   const file = path.join(directory, 'index.jsonl');
   await writeFile(file, bytes);
   const archiveSha = createHash('sha256').update(bytes).digest('hex');
-  return { directory, file, points, sourceSha, archiveSha };
+  const environment = { INDEX_DATA_DIR: directory, INDEX_CARDS_SHA256: cardsSha, INDEX_COLLECTION: collection,
+    INDEX_POINTS: String(count), INDEX_ARCHIVE_SHA256: archiveSha };
+  return { directory, file, points, cardsSha, collection, archiveSha, environment };
 }
 
-test('private index loader verifies roots, hashes, manifest and all 87 vectors', async t => {
-  const fixture = await indexFixture(t);
-  const loaded = await loadIndexFile(fixture.file, { INDEX_DATA_DIR: fixture.directory,
-    INDEX_SOURCE_SHA256: fixture.sourceSha, INDEX_ARCHIVE_SHA256: fixture.archiveSha });
-  assert.equal(loaded.points.length, 87);
-  await assert.rejects(() => loadIndexFile(fixture.file, { INDEX_DATA_DIR: fixture.directory,
-    INDEX_SOURCE_SHA256: fixture.sourceSha, INDEX_ARCHIVE_SHA256: 'b'.repeat(64) }), /SHA-256 mismatch/);
+test('private index loader verifies dynamic counts, hashes, manifest and all vectors', async t => {
+  const fixture = await indexFixture(t, 101);
+  const loaded = await loadIndexFile(fixture.file, fixture.environment);
+  assert.equal(loaded.points.length, 101);
+  await assert.rejects(() => loadIndexFile(fixture.file, { ...fixture.environment, INDEX_ARCHIVE_SHA256: 'b'.repeat(64) }), /SHA-256 mismatch/);
+  await assert.rejects(() => loadIndexFile(fixture.file, { ...fixture.environment, INDEX_POINTS: '100' }), /Invalid index manifest/);
+  await assert.rejects(() => loadIndexFile(fixture.file, { ...fixture.environment, INDEX_COLLECTION: 'wrong' }), /INDEX_COLLECTION/);
 });
 
-test('matching collection is skipped and conflicting collection is never overwritten', async t => {
-  const fixture = await indexFixture(t);
-  const index = await loadIndexFile(fixture.file, { INDEX_DATA_DIR: fixture.directory,
-    INDEX_SOURCE_SHA256: fixture.sourceSha, INDEX_ARCHIVE_SHA256: fixture.archiveSha });
+test('private index loader rejects a damaged vector before any Qdrant call', async t => {
+  const fixture = await indexFixture(t, 2);
+  const lines = (await (await import('node:fs/promises')).readFile(fixture.file, 'utf8')).trimEnd().split('\n');
+  const point = JSON.parse(lines[1]);
+  point.vector.pop();
+  lines[1] = JSON.stringify(point);
+  const bytes = Buffer.from(`${lines.join('\n')}\n`);
+  await writeFile(fixture.file, bytes);
+  await assert.rejects(() => loadIndexFile(fixture.file, { ...fixture.environment,
+    INDEX_ARCHIVE_SHA256: createHash('sha256').update(bytes).digest('hex') }), /Invalid index point/);
+});
+
+test('matching multi-page collection is skipped and conflicting collection is never overwritten', async t => {
+  const fixture = await indexFixture(t, 101);
+  const index = await loadIndexFile(fixture.file, fixture.environment);
   const calls = [];
-  const matchingFetch = async (url, options) => {
-    calls.push({ url, method: options.method ?? 'GET' });
-    if (url.endsWith('/points/scroll')) return Response.json({ result: { points: fixture.points, next_page_offset: null } });
+  const matchingFetch = async (url, options = {}) => {
+    calls.push({ url, method: options.method ?? 'GET', body: options.body && JSON.parse(options.body) });
+    if (url.endsWith('/points/scroll')) {
+      const offset = JSON.parse(options.body).offset;
+      return Response.json({ result: offset === null
+        ? { points: fixture.points.slice(0, 100), next_page_offset: 'second-page' }
+        : { points: fixture.points.slice(100), next_page_offset: null } });
+    }
     return Response.json({ result: { config: { params: { vectors: { size: DIMENSIONS, distance: 'Cosine' } } } } });
   };
   assert.deepEqual(await importIndex(index, { qdrantUrl: 'http://qdrant:6333', qdrantKey: '' }, matchingFetch),
-    { collection: index.manifest.collection, points: 87, skipped: true });
-  assert.deepEqual(calls.map(call => call.method), ['GET', 'POST']);
+    { collection: index.manifest.collection, points: 101, skipped: true });
+  assert.deepEqual(calls.map(call => call.method), ['GET', 'POST', 'POST']);
   const conflict = structuredClone(fixture.points);
   conflict[0].payload.content = 'Изменено';
-  const conflictingFetch = async url => url.endsWith('/points/scroll')
+  const conflictingFetch = async (url, options = {}) => url.endsWith('/points/scroll')
     ? Response.json({ result: { points: conflict, next_page_offset: null } })
     : Response.json({ result: { config: { params: { vectors: { size: DIMENSIONS, distance: 'Cosine' } } } } });
   await assert.rejects(() => importIndex(index, { qdrantUrl: 'http://qdrant:6333', qdrantKey: '' }, conflictingFetch), /refusing to overwrite/);
+});
+
+test('a missing collection is created, uploaded in batches, and verified by a repeat read', async t => {
+  const fixture = await indexFixture(t, 65);
+  const index = await loadIndexFile(fixture.file, fixture.environment);
+  let exists = false;
+  const uploaded = [];
+  const fetchImpl = async (url, options = {}) => {
+    if (options.method === undefined) return exists
+      ? Response.json({ result: { config: { params: { vectors: { size: DIMENSIONS, distance: 'Cosine' } } } } })
+      : new Response('', { status: 404 });
+    if (options.method === 'PUT' && url.includes('/collections/') && !url.includes('/points')) { exists = true; return Response.json({ result: true }); }
+    if (url.endsWith('/points?wait=true')) { uploaded.push(...JSON.parse(options.body).points); return Response.json({ result: { status: 'completed' } }); }
+    if (url.endsWith('/points/scroll')) return Response.json({ result: { points: uploaded, next_page_offset: null } });
+    throw new Error(`Unexpected request ${options.method} ${url}`);
+  };
+  assert.deepEqual(await importIndex(index, { qdrantUrl: 'http://qdrant:6333', qdrantKey: '' }, fetchImpl),
+    { collection: index.manifest.collection, points: 65, skipped: false });
+  assert.equal(uploaded.length, 65);
 });

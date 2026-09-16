@@ -20,6 +20,7 @@ export function loadConfig(env = process.env) {
     allowedOrigins,
     trustedProxies: (env.TRUSTED_PROXY_CIDRS ?? '').split(',').map(v => v.trim()).filter(Boolean),
     timeoutMs: 60000,
+    ragTrace: env.RAG_TRACE === 'true',
   };
   if (config.enabled) {
     if (!/^[A-Za-z0-9_-]{43,256}$/.test(config.token) || [env.OPENAI_API_KEY, env.QDRANT_API_KEY].includes(config.token)) {
@@ -30,7 +31,8 @@ export function loadConfig(env = process.env) {
   return config;
 }
 
-export function createChatHandler(config, { answerQuestion = createRag(config.rag), now = Date.now, log = record => console.log(JSON.stringify(record)) } = {}) {
+export function createChatHandler(config, { answerQuestion, now = Date.now, log = record => console.log(JSON.stringify(record)) } = {}) {
+  const ask = answerQuestion ?? createRag(config.rag);
   const trusted = new BlockList();
   for (const cidr of config.trustedProxies) {
     const [address, prefix] = cidr.split('/');
@@ -117,7 +119,8 @@ export function createChatHandler(config, { answerQuestion = createRag(config.ra
         return reply(400, { error: 'Передайте только message: непустой вопрос до 2000 символов.' });
       }
       result = 'upstream_error';
-      const response = await answerQuestion(body.message.trim(), { signal: controller.signal });
+      const response = await ask(body.message.trim(), { signal: controller.signal,
+        trace: config.ragTrace ? record => log({ requestId, event: 'rag_trace', ...record }) : undefined });
       result = 'ok';
       reply(200, response);
     } catch (error) {
