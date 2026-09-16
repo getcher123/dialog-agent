@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { CHAT_MODEL, DEFAULT_MAX_COMPLETION_TOKENS, DIMENSIONS, EMBEDDING_MODEL, MAX_SOURCES, NO_CONTEXT, SECTION_TOO_LARGE, TOP_K,
-  createRag, loadRagConfig, sourcesFromPoints } from '../backend/rag.mjs';
+  createRag, loadRagConfig, serviceRouteForQuestion, sourcesFromPoints } from '../backend/rag.mjs';
 
 const config = { openaiKey: 'openai-secret', qdrantUrl: 'http://qdrant:6333', qdrantKey: 'qdrant-secret',
   collection: 'betancourt_0123456789abcdef_01234567', maxCompletionTokens: DEFAULT_MAX_COMPLETION_TOKENS };
@@ -25,6 +25,80 @@ function responseQueue(items, calls) {
 test('verified prompt is unchanged from the accepted configuration', async () => {
   const prompt = await readFile(new URL('../backend/prompt.txt', import.meta.url));
   assert.equal(createHash('sha256').update(prompt).digest('hex'), '9955a40abc419c3945932043b2b5262a5544b4f520760d670fce9913cd803eeb');
+});
+
+test('broad resident and management service questions use only their canonical routes', () => {
+  for (const question of [
+    'Какие сервисы есть для жильцов?',
+    'Какие услуги предусмотрены для жителей?',
+    'Какие удобства доступны собственникам?',
+    'Какая инфраструктура предусмотрена для жильцов?',
+  ]) assert.equal(serviceRouteForQuestion(question)?.id, 'resident_services', question);
+  assert.equal(serviceRouteForQuestion('Какие услуги УК доступны жильцам?')?.id, 'management_services');
+  assert.equal(serviceRouteForQuestion('Какие сервисы предоставляет управляющая компания?')?.id, 'management_services');
+  assert.equal(serviceRouteForQuestion('Какие услуги связи доступны жильцам?'), null);
+  assert.equal(serviceRouteForQuestion('Что сказано в разделе «Техническое описание / Сервис для жильцов»?'), null);
+});
+
+test('resident services route loads exact sections without embedding or semantic retrieval', async () => {
+  const calls = [];
+  const traces = [];
+  const resident = point('resident_services', 'Техническое описание / Сервис для жильцов', 'Спортзал, коворкинг и гостевой санузел предусмотрены проектом.');
+  const management = point('management_services', 'Концепция эксплуатации / Конкурентные преимущества сервиса', 'Круглосуточная диспетчерская, управляющий и клининг предусмотрены концепцией.');
+  const rag = createRag(config, { fetchImpl: responseQueue([
+    Response.json({ result: { points: [resident], next_page_offset: null } }),
+    Response.json({ result: { points: [management], next_page_offset: null } }),
+    Response.json({ choices: [{ finish_reason: 'stop', message: { content: 'По проектным материалам доступны два блока сервисов.' } }] }),
+  ], calls) });
+  const result = await rag('Какие сервисы есть для жильцов?', { trace: record => traces.push(record) });
+  assert.deepEqual(result.sources.map(source => source.id), ['resident_services', 'management_services']);
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every(call => !/\/embeddings$|\/points\/query$/.test(call.url)));
+  assert.deepEqual(calls[0].body.filter, { must: [{ key: 'metadata.section', match: { value: resident.payload.metadata.section } }] });
+  assert.deepEqual(calls[1].body.filter, { must: [{ key: 'metadata.section', match: { value: management.payload.metadata.section } }] });
+  assert.match(calls[2].body.messages[0].content, /ровно двумя блоками/i);
+  assert.match(calls[2].body.messages[0].content, /Группа «Инфраструктура для жильцов»[\s\S]*Группа «Сервисы управляющей компании»/);
+  assert.deepEqual(traces[0], { stage: 'route', route: 'resident_services', sections: [resident.payload.metadata.section, management.payload.metadata.section] });
+});
+
+test('management service route takes precedence and does not load resident infrastructure', async () => {
+  const calls = [];
+  const management = point('management_services', 'Концепция эксплуатации / Конкурентные преимущества сервиса', 'Круглосуточная диспетчерская и управляющий.');
+  const rag = createRag(config, { fetchImpl: responseQueue([
+    Response.json({ result: { points: [management], next_page_offset: null } }),
+    Response.json({ choices: [{ finish_reason: 'stop', message: { content: 'Сервисы УК перечислены.' } }] }),
+  ], calls) });
+  const result = await rag('Какие услуги УК доступны жильцам?');
+  assert.deepEqual(result.sources.map(source => source.id), ['management_services']);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].body.filter, { must: [{ key: 'metadata.section', match: { value: management.payload.metadata.section } }] });
+  assert.match(calls[1].body.messages[0].content, /одним блоком/i);
+});
+
+test('narrow resident service question remains on the semantic retrieval path', async () => {
+  const calls = [];
+  const source = point('resident_connection', 'Техническое описание / Слаботочные системы', 'Описание подключения к интернету.');
+  const rag = createRag(config, { fetchImpl: responseQueue([
+    Response.json({ data: [{ index: 0, embedding: vector }] }),
+    Response.json({ result: { points: [source] } }),
+    Response.json({ result: { points: [source], next_page_offset: null } }),
+    Response.json({ choices: [{ finish_reason: 'stop', message: { content: 'Ответ о связи.' } }] }),
+  ], calls) });
+  await rag('Какие услуги связи доступны жильцам?');
+  assert.match(calls[0].url, /\/embeddings$/);
+  assert.match(calls[1].url, /\/points\/query$/);
+});
+
+test('resident route fails closed when one canonical section is unavailable', async () => {
+  const calls = [];
+  const resident = point('resident_services', 'Техническое описание / Сервис для жильцов', 'Спортзал предусмотрен проектом.');
+  const rag = createRag(config, { fetchImpl: responseQueue([
+    Response.json({ result: { points: [resident], next_page_offset: null } }),
+    Response.json({ result: { points: [], next_page_offset: null } }),
+  ], calls) });
+  assert.deepEqual(await rag('Какие сервисы есть для жильцов?'), { answer: NO_CONTEXT, sources: [] });
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(call => !/\/embeddings$|\/points\/query$|\/chat\/completions$/.test(call.url)));
 });
 
 test('direct RAG performs one embedding, one Qdrant query, section expansion and one completion', async () => {

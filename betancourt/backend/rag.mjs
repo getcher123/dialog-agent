@@ -11,6 +11,23 @@ export const DEFAULT_MAX_COMPLETION_TOKENS = 1000;
 export const NO_CONTEXT = 'В найденных фрагментах недостаточно данных для ответа. Уточните вопрос.';
 export const SECTION_TOO_LARGE = 'Вопрос затрагивает слишком большой раздел документа. Уточните, какой именно аспект вам нужен.';
 
+const RESIDENT_SERVICES_ROUTE = {
+  id: 'resident_services',
+  groups: [
+    { label: 'Инфраструктура для жильцов', section: 'Техническое описание / Сервис для жильцов' },
+    { label: 'Сервисы управляющей компании', section: 'Концепция эксплуатации / Конкурентные преимущества сервиса' },
+  ],
+  instruction: 'Это общий вопрос о сервисах жильцов. Ответь ровно двумя блоками с заголовками «Инфраструктура для жильцов» и «Сервисы управляющей компании». В каждом блоке перечисли все разные факты из соответствующей группы контекста. Начни с краткого уточнения, что это предусмотрено проектными материалами и не подтверждает текущую фактическую доступность. Не добавляй сведения из иных разделов, особенно о коммерческих помещениях (ВПП).',
+};
+
+const MANAGEMENT_SERVICES_ROUTE = {
+  id: 'management_services',
+  groups: [
+    { label: 'Сервисы управляющей компании', section: 'Концепция эксплуатации / Конкурентные преимущества сервиса' },
+  ],
+  instruction: 'Это вопрос только о сервисах управляющей компании. Ответь одним блоком с заголовком «Сервисы управляющей компании» и перечисли все разные факты из его группы контекста. Начни с краткого уточнения, что это предусмотрено проектными материалами и не подтверждает текущую фактическую доступность. Не добавляй инфраструктуру жильцов или сведения о коммерческих помещениях (ВПП).',
+};
+
 function boundedInteger(value, fallback, name, { min, max }) {
   if (value === undefined || value === '') return fallback;
   if (!/^\d+$/.test(value)) throw new Error(`${name} must be an integer`);
@@ -69,6 +86,36 @@ function explicitlyRequestedSection(question) {
   return question.match(/(?:^|\s)раздел(?:е|а|ом)?\s*[«"]([^»"]{1,1000})[»"]/iu)?.[1]?.trim();
 }
 
+function normalizeQuestion(question) {
+  return question.toLocaleLowerCase('ru-RU').replace(/ё/gu, 'е').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+function hasBroadServiceTerm(question) {
+  return /(?:^|\s)(?:сервис\p{L}*|услуг\p{L}*|удобств\p{L}*|инфраструктур\p{L}*)(?=\s|$)/iu.test(question);
+}
+
+function hasResidentTerm(question) {
+  return /(?:^|\s)(?:жильц\p{L}*|жител\p{L}*|собственник\p{L}*)(?=\s|$)/iu.test(question);
+}
+
+function hasManagementTerm(question) {
+  return /(?:(?:^|\s)ук(?=\s|$)|(?:^|\s)управляющ\p{L}*\s+компан\p{L}*(?=\s|$)|(?:^|\s)управлени\p{L}*\s+комфорт\p{L}*(?=\s|$))/iu.test(question);
+}
+
+function hasNarrowServiceSubject(question) {
+  return /(?:^|\s)(?:интернет\p{L}*|телефон\p{L}*|телевиден\p{L}*|связ\p{L}*|wi\s*fi|вайфай|парковк\p{L}*|паркинг\p{L}*|домофон\p{L}*|видеонаблюден\p{L}*|мусор\p{L}*|пропуск\p{L}*|доставк\p{L}*)(?=\s|$)/iu.test(question);
+}
+
+// Broad service questions are resolved by exact document sections. Questions
+// with a specific subject continue through semantic retrieval.
+export function serviceRouteForQuestion(question) {
+  if (explicitlyRequestedSection(question)) return null;
+  const normalized = normalizeQuestion(question);
+  if (!hasBroadServiceTerm(normalized) || hasNarrowServiceSubject(normalized)) return null;
+  if (hasManagementTerm(normalized)) return MANAGEMENT_SERVICES_ROUTE;
+  return hasResidentTerm(normalized) ? RESIDENT_SERVICES_ROUTE : null;
+}
+
 function requestsVerbatimSection(question) {
   return /(?:что\s+именно[\s\S]{0,80}?сказано|полный\s+перечень|все\s+строки|покажи(?:те)?\s+все|перечисли(?:те)?\s+все)/iu.test(question);
 }
@@ -108,6 +155,26 @@ async function sectionSources(config, sections, post, signal, trace) {
   return [...sources.values()];
 }
 
+async function routedServiceSources(config, route, post, signal, trace) {
+  const groups = [];
+  let count = 0;
+  for (const group of route.groups) {
+    const sources = await sectionSources(config, [group.section], post, signal, trace);
+    if (sources === null) return null;
+    // A route promises every selected section. Returning one half would make a
+    // complete-looking answer false if a collection is incomplete or misnamed.
+    if (!sources.length) return [];
+    count += sources.length;
+    if (count > MAX_SOURCES) return null;
+    groups.push({ ...group, sources: sources.sort(sourceOrder) });
+  }
+  return groups;
+}
+
+function routedContext(groups) {
+  return groups.map(group => `Группа «${group.label}»:\n${group.sources.map(source => source.excerpt).join('\n\n')}`).join('\n\n');
+}
+
 export function createRag(config, { fetchImpl = fetch, trace: defaultTrace } = {}) {
   async function post(stage, url, headers, body, signal) {
     signal?.throwIfAborted();
@@ -123,8 +190,33 @@ export function createRag(config, { fetchImpl = fetch, trace: defaultTrace } = {
     }
     return res.json();
   }
+  async function completeAnswer(question, sources, context, instruction, signal) {
+    // Use a replacement callback so literal "$&" etc. in source text stay data.
+    const system = `${instruction ? `${instruction}\n\n` : ''}${PROMPT.replace('{context}', () => context)}`;
+    const auth = { Authorization: `Bearer ${config.openaiKey}` };
+    const completion = await post('completion', 'https://api.openai.com/v1/chat/completions', auth,
+      { model: CHAT_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: question }],
+        temperature: 0, max_completion_tokens: config.maxCompletionTokens ?? DEFAULT_MAX_COMPLETION_TOKENS,
+        stream: false, store: false }, signal);
+    const choice = completion?.choices?.[0];
+    const answer = choice?.message?.content;
+    if (completion?.choices?.length !== 1 || choice.finish_reason !== 'stop' || choice.message?.refusal || choice.message?.tool_calls?.length ||
+        typeof answer !== 'string' || !answer.trim() || answer.length > 20000) throw new Error('Invalid or incomplete completion');
+    return { answer, sources };
+  }
+
   return async function answerQuestion(question, { signal, trace = defaultTrace } = {}) {
     if (!config) throw new Error('RAG is not configured');
+    const serviceRoute = serviceRouteForQuestion(question);
+    if (serviceRoute) {
+      safeTrace(trace, { stage: 'route', route: serviceRoute.id, sections: serviceRoute.groups.map(group => group.section) });
+      const groups = await routedServiceSources(config, serviceRoute, post, signal, trace);
+      if (groups === null) return { answer: SECTION_TOO_LARGE, sources: [] };
+      if (!groups.length) return { answer: NO_CONTEXT, sources: [] };
+      const sources = groups.flatMap(group => group.sources);
+      safeTrace(trace, { stage: 'context', sourceChunkIds: sources.map(source => source.id) });
+      return completeAnswer(question, sources, routedContext(groups), serviceRoute.instruction, signal);
+    }
     const auth = { Authorization: `Bearer ${config.openaiKey}` };
     const embedding = await post('embedding', 'https://api.openai.com/v1/embeddings', auth,
       { model: EMBEDDING_MODEL, input: question, dimensions: DIMENSIONS, encoding_format: 'float' }, signal);
@@ -162,16 +254,6 @@ export function createRag(config, { fetchImpl = fetch, trace: defaultTrace } = {
       // a generative summary would choose only representative examples.
       return { answer: sources.map(source => source.excerpt).join('\n\n'), sources };
     }
-    // Use a replacement callback so literal "$&" etc. in source text stay data.
-    const system = PROMPT.replace('{context}', () => sources.map(s => s.excerpt).join('\n\n'));
-    const completion = await post('completion', 'https://api.openai.com/v1/chat/completions', auth,
-      { model: CHAT_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: question }],
-        temperature: 0, max_completion_tokens: config.maxCompletionTokens ?? DEFAULT_MAX_COMPLETION_TOKENS,
-        stream: false, store: false }, signal);
-    const choice = completion?.choices?.[0];
-    const answer = choice?.message?.content;
-    if (completion?.choices?.length !== 1 || choice.finish_reason !== 'stop' || choice.message?.refusal || choice.message?.tool_calls?.length ||
-        typeof answer !== 'string' || !answer.trim() || answer.length > 20000) throw new Error('Invalid or incomplete completion');
-    return { answer, sources };
+    return completeAnswer(question, sources, sources.map(source => source.excerpt).join('\n\n'), '', signal);
   };
 }
